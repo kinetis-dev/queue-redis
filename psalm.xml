@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<!--
+    errorLevel="8" is Psalm's loosest, most-permissive level (1
+    is Psalm's strictest) — the opposite direction from PHPStan's own
+    `level: 8` in phpstan.neon, which IS PHPStan's strictest level. The two
+    `8`s are not comparable strictness settings despite the shared number.
+-->
+<psalm
+    errorLevel="8"
+    resolveFromConfigFile="true"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns="https://getpsalm.org/schema/config"
+    xsi:schemaLocation="https://getpsalm.org/schema/config vendor/vimeo/psalm/config.xsd"
+    findUnusedBaselineEntry="true"
+    findUnusedCode="false"
+>
+    <projectFiles>
+        <directory name="src" />
+        <ignoreFiles>
+            <directory name="vendor" />
+        </ignoreFiles>
+    </projectFiles>
+</psalm>
+
