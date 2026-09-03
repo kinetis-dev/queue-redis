@@ -9,8 +9,11 @@ use Amp\Redis\RedisClient;
 use Kinetis\Queue\Exception\StaleJobHandleException;
 use Kinetis\Queue\Job;
 use Kinetis\Queue\JobSerializer;
+use Kinetis\Queue\QueueContract;
 use Kinetis\Queue\QueuedJob;
 use Kinetis\Queue\QueueInterface;
+use Kinetis\Queue\Support\PopSweep;
+use LogicException;
 use Throwable;
 
 /**
@@ -29,14 +32,27 @@ use Throwable;
  * `:processing`, `:delayed`) — named queues are genuinely separate Redis
  * lists/sorted sets, not one shared structure with a filter on top.
  *
- * pop($timeoutSeconds, $queues) checking multiple queues in priority
- * order does not use amphp/redis's non-blocking popTailPushHead() (plain
- * RPOPLPUSH) to "peek" each queue first — its declared return type is
- * non-nullable `string`, but Redis returns nil for an empty source list,
- * which throws a TypeError inside amphp/redis itself. Each queue in
- * priority order instead gets a short blocking check via the
- * correctly-nullable popTailPushHeadBlocking(), cycling through the whole
- * list until something's found or the overall timeout elapses.
+ * pop($timeoutSeconds, $queues) delegates its whole priority/timeout
+ * algorithm to Kinetis\Queue\Support\PopSweep — see that class and
+ * QueueInterface's own docblock for the full cross-backend contract.
+ * This class supplies exactly one thing PopSweep needs: probe(), a
+ * single-queue check that can spend up to a given wait budget.
+ *
+ * probe() cannot use amphp/redis's non-blocking popTailPushHead() (plain
+ * RPOPLPUSH) for PopSweep's own zero-wait, immediate phase — its declared
+ * return type is non-nullable `string`, but Redis returns nil for an
+ * empty source list, which throws a TypeError inside amphp/redis itself.
+ * probeNonBlocking() instead runs its own small Lua script — an atomic,
+ * genuinely non-blocking RPOP+LPUSH pair — bypassing that buggy wrapper
+ * entirely while keeping the exact same reliable pending->processing
+ * move semantics. For a real, positive wait budget, probeBlocking() uses
+ * the correctly-nullable popTailPushHeadBlocking() instead — but never
+ * with a literal 0 for the timeout: BRPOPLPUSH's own timeout=0 means
+ * "block forever," the opposite of PopSweep's own "don't block at all"
+ * meaning for a zero wait budget, so a sub-one-second remaining budget
+ * (Redis's blocking primitives have no fractional timeout) is handled by
+ * one more non-blocking probe instead of rounding either up (overshooting
+ * the deadline) or down to a literal 0 (blocking forever).
  *
  * Deliberately not built: a reaper for jobs stuck in a processing list
  * because the worker that popped them crashed before ack()/release()
@@ -121,6 +137,8 @@ final readonly class RedisQueue implements QueueInterface
     #[\Override]
     public function push(Job $job, int $delaySeconds = 0, string $queue = 'default', ?int $maxAttempts = null): void
     {
+        QueueContract::assertValidPushArguments($delaySeconds, $queue, $maxAttempts);
+
         $telemetryToken = Telemetry::global()->jobPushStarted($job::class, $queue);
 
         try {
@@ -144,45 +162,141 @@ final readonly class RedisQueue implements QueueInterface
     #[\Override]
     public function pop(int $timeoutSeconds = 0, array $queues = ['default']): ?QueuedJob
     {
-        if ($queues === []) {
+        // PopSweep::run() itself validates $timeoutSeconds/$queues via
+        // QueueContract before touching either — see that class's own
+        // docblock for why it doesn't trust a caller to have already
+        // done so.
+        return PopSweep::run(
+            timeoutSeconds: $timeoutSeconds,
+            queues: $queues,
+            probe: function (string $queue, float $waitSeconds): ?QueuedJob {
+                $this->promoteDelayedJobs($queue);
+
+                return $waitSeconds < 1.0
+                    ? $this->probeNonBlocking($queue)
+                    : $this->probeBlocking($queue, (int) floor($waitSeconds));
+            },
+            probeCanBlock: true,
+            waitCapSeconds: (float) self::PER_QUEUE_POLL_TIMEOUT_SECONDS,
+            sleep: static function (): never {
+                throw new LogicException('RedisQueue never paces via sleep() — every probe either blocks natively or is instant.');
+            },
+        );
+    }
+
+    /**
+     * The immediate, non-blocking half of probe() — an atomic RPOP+LPUSH
+     * pair run as one Lua script, never amphp/redis's own buggy
+     * popTailPushHead() wrapper (see this class's own docblock for why).
+     * `redis.call('RPOP', ...)` returning nothing becomes a Lua `false`,
+     * which the RESP protocol reports back as a null bulk reply —
+     * $this->redis->eval() itself is typed `mixed`, so unlike the buggy
+     * wrapper there's no non-nullable-string coercion to trip over here.
+     */
+    private function probeNonBlocking(string $queue): ?QueuedJob
+    {
+        $payload = $this->redis->eval(
+            <<<'LUA'
+            local payload = redis.call('RPOP', KEYS[1])
+            if payload then
+                redis.call('LPUSH', KEYS[2], payload)
+            end
+            return payload
+            LUA,
+            [self::pendingKey($queue), self::processingKey($queue)],
+            [],
+        );
+
+        if ($payload === null) {
             return null;
         }
 
-        $deadline = $timeoutSeconds > 0 ? microtime(true) + $timeoutSeconds : null;
+        /** @var string $payload */
+        return QueueContract::settleIfMalformed(
+            $queue,
+            fn (): QueuedJob => $this->decodeQueuedJob($queue, $payload),
+            fn () => $this->removeFromProcessing($queue, $payload),
+        );
+    }
 
-        while (true) {
-            foreach ($queues as $queue) {
-                $this->promoteDelayedJobs($queue);
+    /**
+     * The bounded-wait half of probe() — a genuine BRPOPLPUSH, blocking
+     * for up to $waitSeconds real seconds. Never called with 0: Redis's
+     * own blocking primitives treat a literal 0 timeout as "block
+     * forever," not "don't block at all" — probe()'s own dispatch routes
+     * anything below one second (where that ambiguity would otherwise
+     * bite, since these primitives have no fractional timeout either) to
+     * probeNonBlocking() instead.
+     */
+    private function probeBlocking(string $queue, int $waitSeconds): ?QueuedJob
+    {
+        $payload = $this->redis->getList(self::pendingKey($queue))
+            ->popTailPushHeadBlocking(self::processingKey($queue), $waitSeconds);
 
-                $payload = $this->redis->getList(self::pendingKey($queue))
-                    ->popTailPushHeadBlocking(self::processingKey($queue), self::PER_QUEUE_POLL_TIMEOUT_SECONDS);
-
-                if ($payload !== null) {
-                    /** @var array{class: class-string<Job>, args: array<string, mixed>, attempts: int, maxAttempts: int|null, metadata?: array<string, string>} $decoded */
-                    $decoded = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
-
-                    return new QueuedJob(
-                        $decoded['class'],
-                        $decoded['args'],
-                        handle: $payload,
-                        queue: $queue,
-                        attempts: $decoded['attempts'] + 1,
-                        maxAttempts: $decoded['maxAttempts'],
-                        metadata: $decoded['metadata'] ?? [],
-                    );
-                }
-
-                if ($deadline !== null && microtime(true) >= $deadline) {
-                    return null;
-                }
-            }
+        if ($payload === null) {
+            return null;
         }
+
+        return QueueContract::settleIfMalformed(
+            $queue,
+            fn (): QueuedJob => $this->decodeQueuedJob($queue, $payload),
+            fn () => $this->removeFromProcessing($queue, $payload),
+        );
+    }
+
+    /**
+     * Every field is read through one of QueueContract's own coercion
+     * helpers rather than trusted at a PHPStan-asserted @var shape — a
+     * hand-edited or otherwise corrupted JSON payload could carry
+     * anything, from a body that isn't even valid JSON to a `class`
+     * field that's missing, an `args` field that isn't an array, or an
+     * `attempts`/`maxAttempts` value that isn't a clean integer.
+     * attempts specifically goes through coerceStoredCompletedAttempts(),
+     * not the plain coerceStoredInteger() maxAttempts uses — this stored
+     * value is the completed-attempts count (0-indexed) that gets a real
+     * `+ 1` right below, and that method is what keeps a stored
+     * PHP_INT_MAX from silently overflowing that addition into a float,
+     * and also rejects a negative stored count outright — a value that
+     * parses cleanly but would otherwise produce a final attempts value
+     * below QueuedJob's own 1-indexed floor. maxAttempts is checked for
+     * *presence* first — QueueContract::assertFieldPresent() — since
+     * encode() below always writes this key, even when its own value is
+     * null; only a genuinely missing key is a sign of a truncated
+     * envelope, which a plain `?? null` read could never distinguish
+     * from a present, legitimately-null value. Every failure here is
+     * caught by this class's own probeNonBlocking()/probeBlocking() —
+     * see QueueContract::settleIfMalformed() — so a malformed payload
+     * settles the already-reserved message rather than crashing the
+     * worker.
+     */
+    private function decodeQueuedJob(string $queue, string $payload): QueuedJob
+    {
+        $decoded = QueueContract::coerceStoredJsonArray($payload, 'payload');
+
+        $class = QueueContract::coerceStoredClass($decoded['class'] ?? null);
+        $args = QueueContract::coerceStoredArgs($decoded['args'] ?? null);
+        $metadata = QueueContract::coerceStoredMetadata($decoded['metadata'] ?? null);
+
+        QueueContract::assertFieldPresent($decoded, 'maxAttempts');
+        $maxAttempts = QueueContract::coerceStoredMaxAttempts($decoded['maxAttempts'], 'maxAttempts');
+
+        return new QueuedJob(
+            $class,
+            $args,
+            handle: $payload,
+            queue: $queue,
+            attempts: QueueContract::coerceStoredCompletedAttempts($decoded['attempts'] ?? null, 'attempts') + 1,
+            maxAttempts: $maxAttempts,
+            metadata: $metadata,
+        );
     }
 
     #[\Override]
     public function ack(QueuedJob $job): void
     {
-        $this->removeFromProcessing($job);
+        /** @var string $payload */
+        $payload = $job->handle;
+        $this->removeFromProcessing($job->queue, $payload);
     }
 
     #[\Override]
@@ -249,7 +363,9 @@ final readonly class RedisQueue implements QueueInterface
     #[\Override]
     public function fail(QueuedJob $job): void
     {
-        $this->removeFromProcessing($job);
+        /** @var string $payload */
+        $payload = $job->handle;
+        $this->removeFromProcessing($job->queue, $payload);
     }
 
     /**
@@ -261,6 +377,8 @@ final readonly class RedisQueue implements QueueInterface
     #[\Override]
     public function size(string $queue = 'default'): int
     {
+        QueueContract::assertValidQueueName($queue);
+
         return $this->redis->getList(self::pendingKey($queue))->getSize()
             + $this->redis->getSortedSet(self::delayedKey($queue))->getSize();
     }
@@ -268,17 +386,26 @@ final readonly class RedisQueue implements QueueInterface
     #[\Override]
     public function clear(string $queue = 'default'): int
     {
+        // size() validates $queue before touching Redis at all — clear()
+        // calls it first specifically so this stays the one place that
+        // check happens, not a second copy here.
         $size = $this->size($queue);
         $this->redis->delete(self::pendingKey($queue), self::delayedKey($queue));
 
         return $size;
     }
 
-    private function removeFromProcessing(QueuedJob $job): void
+    /**
+     * Shared by ack()/fail() (a real QueuedJob's own handle/queue) and
+     * the malformed-message settlement path in probeNonBlocking()/
+     * probeBlocking() (the raw payload/queue a decode failure was
+     * caught for, with no QueuedJob to read them off of) — the same
+     * underlying LREM either way, just reached from two different
+     * starting shapes.
+     */
+    private function removeFromProcessing(string $queue, string $payload): void
     {
-        /** @var string $payload */
-        $payload = $job->handle;
-        $this->redis->getList(self::processingKey($job->queue))->remove($payload, 1);
+        $this->redis->getList(self::processingKey($queue))->remove($payload, 1);
     }
 
     /**
@@ -305,7 +432,11 @@ final readonly class RedisQueue implements QueueInterface
             'attempts' => $attempts,
             'maxAttempts' => $maxAttempts,
             'metadata' => $metadata,
-        ], JSON_THROW_ON_ERROR);
+            // PRESERVE_ZERO_FRACTION: without it, an integral-valued
+            // float argument (4.0) encodes as "4" and decodes back as
+            // an int — a silent type change JobSerializer::serialize()'s
+            // own portable-value contract promises never happens.
+        ], JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
     }
 
     /**

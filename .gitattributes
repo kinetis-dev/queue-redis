@@ -3,3 +3,5 @@
 /phpunit.xml export-ignore
 /tests export-ignore
 /tests/** export-ignore
+/tests-integration export-ignore
+/tests-integration/** export-ignore
