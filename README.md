@@ -38,6 +38,22 @@ $queue = RedisQueueFactory::fromConfig($config);
 $queue->push(new SendWelcomeEmail($email, $name), queue: 'default');
 ```
 
+`RedisQueue` declares `Kinetis\Queue\ClearableQueueInterface`.
+Clearing counts and removes the queue's pending and delayed entries in
+one Lua script, so the number it reports is what it removed; the
+processing list is untouched.
+
+All three settlements are fenced against a delivery that is already
+over. `release()`'s Lua script performs its replacement only when the
+`LREM` found the source entry, and `ack()`/`fail()` read the same count
+back, so a duplicate, retried or reclaimed settlement raises
+`Kinetis\Queue\Exception\StaleJobHandleException` rather than
+reporting a removal that never happened.
+
+A worker that dies mid-job leaves its payload in the processing list.
+Nothing returns it to `pending` — there is no reaper — so the job is
+stranded rather than redelivered.
+
 ## Configuration
 
 ```

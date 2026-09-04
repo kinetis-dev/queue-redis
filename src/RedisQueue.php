@@ -6,13 +6,14 @@ namespace Kinetis\QueueRedis;
 
 use Kinetis\Instrumentation\Telemetry;
 use Amp\Redis\RedisClient;
+use Kinetis\Queue\ClearableQueueInterface;
 use Kinetis\Queue\Exception\MalformedQueuedJobDataException;
 use Kinetis\Queue\Exception\StaleJobHandleException;
 use Kinetis\Queue\Job;
 use Kinetis\Queue\JobSerializer;
+use Kinetis\Queue\JobSettlement;
 use Kinetis\Queue\QueueContract;
 use Kinetis\Queue\QueuedJob;
-use Kinetis\Queue\QueueInterface;
 use Kinetis\Queue\Support\PopSweep;
 use LogicException;
 use Throwable;
@@ -87,6 +88,19 @@ use Throwable;
  * ready, so two concurrent calls simply serialize through Redis with
  * nothing left for the second to double-process.
  *
+ * All three settlements are fenced against a delivery that is already
+ * over. LREM reports how many entries it removed, so ack() and fail()
+ * read that count the same way release()'s script returns its own: a
+ * zero means the processing list held no entry for this handle, and the
+ * settlement raises Exception\StaleJobHandleException rather than
+ * reporting a removal that never happened. QueuedJob's own docblock
+ * states the delivery-receipt contract this meets.
+ *
+ * The malformed-message path settles through the same LREM without
+ * reading it back: the message it settles was reserved moments earlier
+ * by this very call, so there is no stale delivery to report and pop()
+ * raises Exception\MalformedQueuedJobDataException instead.
+ *
  * Every envelope carries a cryptographically random `id`, generated fresh
  * for an independent push(): two pushes with byte-identical job data
  * would otherwise produce the exact same JSON string, and a Redis sorted
@@ -115,7 +129,7 @@ use Throwable;
  * of *completed* attempts (0 at push time); QueuedJob::$attempts is
  * always that value plus one.
  */
-final readonly class RedisQueue implements QueueInterface
+final readonly class RedisQueue implements ClearableQueueInterface
 {
     private const PER_QUEUE_POLL_TIMEOUT_SECONDS = 1;
 
@@ -239,7 +253,9 @@ final readonly class RedisQueue implements QueueInterface
         return QueueContract::settleIfMalformed(
             $queue,
             fn (): QueuedJob => $this->decodeQueuedJob($queue, $payload),
-            fn () => $this->removeFromProcessing($queue, $payload),
+            function () use ($queue, $payload): void {
+                $this->removeFromProcessing($queue, $payload);
+            },
         );
     }
 
@@ -264,7 +280,9 @@ final readonly class RedisQueue implements QueueInterface
         return QueueContract::settleIfMalformed(
             $queue,
             fn (): QueuedJob => $this->decodeQueuedJob($queue, $payload),
-            fn () => $this->removeFromProcessing($queue, $payload),
+            function () use ($queue, $payload): void {
+                $this->removeFromProcessing($queue, $payload);
+            },
         );
     }
 
@@ -335,7 +353,7 @@ final readonly class RedisQueue implements QueueInterface
     {
         /** @var string $payload */
         $payload = $job->handle;
-        $this->removeFromProcessing($job->queue, $payload);
+        $this->settle(JobSettlement::Ack, $job->queue, $payload);
     }
 
     #[\Override]
@@ -391,7 +409,7 @@ final readonly class RedisQueue implements QueueInterface
         );
 
         if ($removed !== 1) {
-            throw StaleJobHandleException::forRelease($job->queue);
+            throw StaleJobHandleException::forSettlement(JobSettlement::Release, $job->queue);
         }
     }
 
@@ -400,7 +418,7 @@ final readonly class RedisQueue implements QueueInterface
     {
         /** @var string $payload */
         $payload = $job->handle;
-        $this->removeFromProcessing($job->queue, $payload);
+        $this->settle(JobSettlement::Fail, $job->queue, $payload);
     }
 
     /**
@@ -418,29 +436,53 @@ final readonly class RedisQueue implements QueueInterface
             + $this->redis->getSortedSet(self::delayedKey($queue))->getSize();
     }
 
+    /**
+     * Counting and deleting run as one Lua script rather than a size()
+     * followed by a DEL: a job pushed between the two would otherwise be
+     * deleted without being counted, and DEL's own return value counts
+     * keys, not the jobs inside them. The number returned is what this
+     * call removed.
+     */
     #[\Override]
     public function clear(string $queue = 'default'): int
     {
-        // size() validates $queue before touching Redis at all — clear()
-        // calls it first specifically so this stays the one place that
-        // check happens, not a second copy here.
-        $size = $this->size($queue);
-        $this->redis->delete(self::pendingKey($queue), self::delayedKey($queue));
+        QueueContract::assertValidQueueName($queue);
 
-        return $size;
+        $removed = $this->redis->eval(
+            <<<'LUA'
+            local removed = redis.call('LLEN', KEYS[1]) + redis.call('ZCARD', KEYS[2])
+            redis.call('DEL', KEYS[1], KEYS[2])
+            return removed
+            LUA,
+            [self::pendingKey($queue), self::delayedKey($queue)],
+        );
+
+        return (int) $removed;
     }
 
     /**
-     * Shared by ack()/fail() (a real QueuedJob's own handle/queue) and
-     * the malformed-message settlement path in probeNonBlocking()/
+     * ack()/fail(), which settle a delivery a caller holds a handle for
+     * and so have someone to answer when that delivery is already over.
+     */
+    private function settle(JobSettlement $operation, string $queue, string $payload): void
+    {
+        if ($this->removeFromProcessing($queue, $payload) !== 1) {
+            throw StaleJobHandleException::forSettlement($operation, $queue);
+        }
+    }
+
+    /**
+     * Shared by settle() (a real QueuedJob's own handle/queue) and the
+     * malformed-message settlement path in probeNonBlocking()/
      * probeBlocking() (the raw payload/queue a decode failure was
      * caught for, with no QueuedJob to read them off of) — the same
      * underlying LREM either way, just reached from two different
-     * starting shapes.
+     * starting shapes. The count is how many entries LREM removed: 1
+     * for a live reservation, 0 for a delivery that is already over.
      */
-    private function removeFromProcessing(string $queue, string $payload): void
+    private function removeFromProcessing(string $queue, string $payload): int
     {
-        $this->redis->getList(self::processingKey($queue))->remove($payload, 1);
+        return $this->redis->getList(self::processingKey($queue))->remove($payload, 1);
     }
 
     /**
