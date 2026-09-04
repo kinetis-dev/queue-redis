@@ -6,6 +6,7 @@ namespace Kinetis\QueueRedis;
 
 use Kinetis\Instrumentation\Telemetry;
 use Amp\Redis\RedisClient;
+use Kinetis\Queue\Exception\MalformedQueuedJobDataException;
 use Kinetis\Queue\Exception\StaleJobHandleException;
 use Kinetis\Queue\Job;
 use Kinetis\Queue\JobSerializer;
@@ -87,29 +88,32 @@ use Throwable;
  * nothing left for the second to double-process.
  *
  * Every envelope carries a cryptographically random `id`, generated fresh
- * only for an independent push() — without it, two pushes with
- * byte-identical job data produced the exact same JSON string, and a
- * Redis sorted set's members are unique, so the second push() of a
- * delayed duplicate silently collapsed onto the first instead of creating
- * a second entry. release() preserves the `id`/`pushedAt` it reads back
- * off the envelope it's replacing rather than regenerating them: a fresh
- * id only ever needed to hold *between* independent pushes, and
- * regenerating it on every retry would erase the job's own logical
- * identity and original enqueue time for no benefit. Both are read with
- * `?? null`, not assumed present: a job pushed by the envelope format
- * that predates `id`/`pushedAt` is still a valid, poppable payload after
- * an upgrade, and release()ing one falls through to encode()'s own
- * fresh-value default rather than a missing-key warning (or, worse, an
- * exception in an application that turns warnings into one — with no
- * reaper, that would strand the job in `processing` indefinitely). Once
- * released, the job's envelope is the current format from then on.
+ * for an independent push(): two pushes with byte-identical job data
+ * would otherwise produce the exact same JSON string, and a Redis sorted
+ * set's members are unique, so the second push() of a delayed duplicate
+ * would collapse onto the first instead of creating a second entry.
+ * release() preserves the `id`/`pushedAt` it reads off the envelope it's
+ * replacing rather than regenerating them — uniqueness only ever has to
+ * hold *between* independent pushes, and regenerating on every retry
+ * would erase the job's own logical identity and original enqueue time
+ * for no benefit.
  *
  * Redis has no per-job columns the way SqlQueue has an `attempts` column,
- * so attempts/maxAttempts travel inside the JSON payload itself —
- * {id, pushedAt, class, args, attempts, maxAttempts, metadata} — reread
- * and rewritten by release() on every retry. The stored value is the
- * number of *completed* attempts (0 at push time); QueuedJob::$attempts
- * is always that value plus one.
+ * so attempts/maxAttempts travel inside the JSON payload itself. The
+ * envelope is exactly {id, pushedAt, class, args, attempts, maxAttempts,
+ * metadata}, reread and rewritten by release() on every retry, and all
+ * seven keys are required — `metadata` included, whose absence is a
+ * truncated envelope rather than "no metadata was stored".
+ * decodeQueuedJob() validates every one of them before a QueuedJob
+ * exists, each against the shape encode() writes rather than the widest
+ * shape a cross-backend coercer accepts: `id` is 32 lowercase
+ * hexadecimal characters, and `pushedAt` a positive Unix timestamp that
+ * json_decode() returned as a native integer. An envelope missing or
+ * corrupting any of them settles through
+ * QueueContract::settleIfMalformed() instead of reaching ack()/release()
+ * as a partially accepted job. The stored `attempts` value is the number
+ * of *completed* attempts (0 at push time); QueuedJob::$attempts is
+ * always that value plus one.
  */
 final readonly class RedisQueue implements QueueInterface
 {
@@ -130,6 +134,19 @@ final readonly class RedisQueue implements QueueInterface
      */
     private const int DELAYED_PROMOTION_BATCH_SIZE = 100;
 
+    /**
+     * The exact shape push() writes for `id`: bin2hex(random_bytes(16)),
+     * which is 32 hexadecimal characters, lowercase because that is the
+     * only case bin2hex() emits. envelopeIdentity() matches against this
+     * rather than accepting any non-empty string, so an identity from
+     * some other producer is corrupted storage here, not a job.
+     *
+     * The end anchor is `\z`, not `$`: PCRE's `$` also matches directly
+     * before a trailing newline, which would let 32 hex characters plus
+     * a newline through as a valid id.
+     */
+    private const string ID_PATTERN = '/^[0-9a-f]{32}\z/';
+
     public function __construct(
         private RedisClient $redis,
     ) {}
@@ -143,7 +160,14 @@ final readonly class RedisQueue implements QueueInterface
 
         try {
             $metadata = Telemetry::global()->jobPushMetadata($telemetryToken);
-            $payload = self::encode(JobSerializer::serialize($job), attempts: 0, maxAttempts: $maxAttempts, metadata: $metadata);
+            $payload = self::encode(
+                JobSerializer::serialize($job),
+                attempts: 0,
+                maxAttempts: $maxAttempts,
+                metadata: $metadata,
+                id: bin2hex(random_bytes(16)),
+                pushedAt: time(),
+            );
 
             if ($delaySeconds > 0) {
                 $this->redis->getSortedSet(self::delayedKey($queue))->add([$payload => (float) (time() + $delaySeconds)]);
@@ -263,7 +287,18 @@ final readonly class RedisQueue implements QueueInterface
      * encode() below always writes this key, even when its own value is
      * null; only a genuinely missing key is a sign of a truncated
      * envelope, which a plain `?? null` read could never distinguish
-     * from a present, legitimately-null value. Every failure here is
+     * from a present, legitimately-null value. `metadata` gets the same
+     * presence check before its own shape is coerced, and for the same
+     * reason: coerceStoredMetadata() reads an absent value as an empty
+     * map — the right reading for the backends that write the field only
+     * when a caller supplied metadata — so a missing key here would
+     * otherwise decode into an accepted job. encode() always writes it,
+     * so presence has to be established separately. `id` and `pushedAt`
+     * go through envelopeIdentity() below, which checks presence and
+     * then the exact shape this encoder writes, before any QueuedJob
+     * exists — so an envelope missing or corrupting either one settles
+     * here rather than being accepted as a job whose release() would
+     * then have no identity to preserve. Every failure here is
      * caught by this class's own probeNonBlocking()/probeBlocking() —
      * see QueueContract::settleIfMalformed() — so a malformed payload
      * settles the already-reserved message rather than crashing the
@@ -273,9 +308,13 @@ final readonly class RedisQueue implements QueueInterface
     {
         $decoded = QueueContract::coerceStoredJsonArray($payload, 'payload');
 
+        self::envelopeIdentity($decoded);
+
         $class = QueueContract::coerceStoredClass($decoded['class'] ?? null);
         $args = QueueContract::coerceStoredArgs($decoded['args'] ?? null);
-        $metadata = QueueContract::coerceStoredMetadata($decoded['metadata'] ?? null);
+
+        QueueContract::assertFieldPresent($decoded, 'metadata');
+        $metadata = QueueContract::coerceStoredMetadata($decoded['metadata']);
 
         QueueContract::assertFieldPresent($decoded, 'maxAttempts');
         $maxAttempts = QueueContract::coerceStoredMaxAttempts($decoded['maxAttempts'], 'maxAttempts');
@@ -305,32 +344,28 @@ final readonly class RedisQueue implements QueueInterface
         /** @var string $oldPayload */
         $oldPayload = $job->handle;
 
-        /** @var array{id?: string, pushedAt?: int} $oldEnvelope */
-        $oldEnvelope = json_decode($oldPayload, true, flags: JSON_THROW_ON_ERROR);
-
-        // id/pushedAt are preserved from the envelope being replaced, not
-        // regenerated — a fresh id only needs to be unique *between
+        // id/pushedAt are carried over from the envelope being replaced,
+        // not regenerated — a fresh id only needs to be unique *between
         // independent pushes* (see encode()'s own docblock, and this
         // class's own docblock for why the delayed sorted set needs
-        // that). Regenerating it here would erase the job's logical
+        // that). Regenerating either here would erase the job's logical
         // identity and original enqueue time across every retry instead.
         //
-        // Both are read with ?? null, not unconditionally: a job pushed
-        // by the pre-id envelope format (class/args/attempts/maxAttempts/
-        // metadata only, no id/pushedAt at all) is still a valid,
-        // poppable payload after an upgrade — release()ing one must not
-        // depend on a key that version never wrote. Falling through to
-        // encode()'s own fresh-id/fresh-pushedAt default the first time a
-        // legacy job is released is what a rolling upgrade needs: after
-        // that release, the job's envelope is the current format and
-        // every later retry preserves the id encode() generated then.
+        // Both are required fields, read through the same
+        // envelopeIdentity() check decodeQueuedJob() already applied to
+        // this exact payload before handing back the QueuedJob whose
+        // handle it is.
+        [$id, $pushedAt] = self::envelopeIdentity(
+            QueueContract::coerceStoredJsonArray($oldPayload, 'payload'),
+        );
+
         $newPayload = self::encode(
             ['class' => $job->class, 'args' => $job->args],
             attempts: $job->attempts,
             maxAttempts: $job->maxAttempts,
             metadata: $job->metadata,
-            id: $oldEnvelope['id'] ?? null,
-            pushedAt: $oldEnvelope['pushedAt'] ?? null,
+            id: $id,
+            pushedAt: $pushedAt,
         );
 
         // One Lua script, not a remove() call followed by a separate
@@ -409,25 +444,23 @@ final readonly class RedisQueue implements QueueInterface
     }
 
     /**
-     * A fresh `id` is generated only when $id is omitted — push() relies
-     * on that default, since a fresh id per *independent* push is what
-     * keeps two envelopes with byte-identical job data from ever becoming
-     * the same string (see this class's own docblock for why that matters
+     * Writes every field of the envelope, identity included — the id and
+     * pushedAt are always the caller's own, never invented here: push()
+     * generates a fresh pair per *independent* push (which is what keeps
+     * two envelopes with byte-identical job data from ever becoming the
+     * same string — see this class's own docblock for why that matters
      * specifically for the delayed sorted set, whose members must be
-     * unique). release() instead passes the id/pushedAt it read back off
-     * the envelope being replaced: uniqueness only ever needed to hold
-     * between independent pushes, not across retries of the same job, and
-     * regenerating it on every retry would erase the job's own logical
-     * identity and original enqueue time for no benefit.
+     * unique), and release() passes the pair it read off the envelope
+     * being replaced.
      *
      * @param array{class: class-string, args: array<string, mixed>} $serialized
      * @param array<string, string> $metadata
      */
-    private static function encode(array $serialized, int $attempts, ?int $maxAttempts, array $metadata = [], ?string $id = null, ?int $pushedAt = null): string
+    private static function encode(array $serialized, int $attempts, ?int $maxAttempts, array $metadata, string $id, int $pushedAt): string
     {
         return json_encode([
-            'id' => $id ?? bin2hex(random_bytes(16)),
-            'pushedAt' => $pushedAt ?? time(),
+            'id' => $id,
+            'pushedAt' => $pushedAt,
             ...$serialized,
             'attempts' => $attempts,
             'maxAttempts' => $maxAttempts,
@@ -437,6 +470,58 @@ final readonly class RedisQueue implements QueueInterface
             // an int — a silent type change JobSerializer::serialize()'s
             // own portable-value contract promises never happens.
         ], JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
+    }
+
+    /**
+     * The two identity fields of a current envelope, validated rather
+     * than read optionally: `id` is what keeps two byte-identical jobs
+     * from collapsing into one member of the delayed sorted set, and
+     * `pushedAt` is the job's original enqueue time, which release()
+     * carries across every retry. Both are written by encode() on every
+     * push, so an envelope missing or corrupting either is corrupted
+     * storage — the same judgment decodeQueuedJob() already makes for
+     * `class`/`args`/`attempts`/`maxAttempts`/`metadata`, reached
+     * through the same MalformedQueuedJobDataException.
+     *
+     * Each is checked against the one shape this encoder writes, not the
+     * widest shape a value of that kind could take. `id` must match
+     * ID_PATTERN: push() writes bin2hex(random_bytes(16)), so a UUID's
+     * dashed form, uppercase hex, or a hex run of the wrong length came
+     * from somewhere else, and accepting one would mean release()
+     * carrying an identity the delayed sorted set's uniqueness never
+     * rested on. `pushedAt` must be a native integer as json_decode()
+     * returned it, and positive: push() writes time() as a JSON number,
+     * so a numeric string, a float, a bool, or a zero/negative timestamp
+     * is a value this format never stored.
+     * QueueContract::coerceStoredInteger() accepts the numeric-string
+     * form on purpose, since other backends keep the same bookkeeping in
+     * text columns and headers — which is why the narrower check belongs
+     * here rather than there.
+     *
+     * @param array<array-key, mixed> $decoded
+     * @return array{0: string, 1: int}
+     */
+    private static function envelopeIdentity(array $decoded): array
+    {
+        QueueContract::assertFieldPresent($decoded, 'id');
+        $id = $decoded['id'];
+
+        if (!is_string($id) || preg_match(self::ID_PATTERN, $id) !== 1) {
+            throw MalformedQueuedJobDataException::invalidShape('id', $id);
+        }
+
+        QueueContract::assertFieldPresent($decoded, 'pushedAt');
+        $pushedAt = $decoded['pushedAt'];
+
+        if (!is_int($pushedAt)) {
+            throw MalformedQueuedJobDataException::invalidShape('pushedAt', $pushedAt);
+        }
+
+        if ($pushedAt < 1) {
+            throw MalformedQueuedJobDataException::outOfBounds('pushedAt', $pushedAt, 'an enqueue timestamp must be a positive Unix time');
+        }
+
+        return [$id, $pushedAt];
     }
 
     /**

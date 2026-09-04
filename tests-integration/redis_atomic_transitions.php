@@ -39,7 +39,6 @@ use Amp\Redis\RedisClient;
 use Kinetis\Async\Timer;
 use Kinetis\Queue\Exception\StaleJobHandleException;
 use Kinetis\Queue\Job;
-use Kinetis\Queue\QueuedJob;
 use Kinetis\QueueRedis\RedisQueue;
 
 use function Amp\Redis\createRedisClient;
@@ -289,62 +288,6 @@ check(
     'double-release: still exactly one pending entry — the stale second call wrote no replacement',
     count($redis->getList($pendingKey)->getRange()) === 1,
 );
-
-// --- release(): a job written by the envelope format that predates
-// id/pushedAt (class/args/attempts/maxAttempts/metadata only) must still
-// be release()-able after an upgrade — the deterministic KIN-29
-// regression. A warning-to-exception handler is installed specifically
-// because PHP's default warning policy silently tolerates the missing
-// keys (the nullable encoder arguments happen to turn them into a fresh
-// id/time either way), which is exactly why this bug shipped unnoticed —
-// without the handler, this check would pass whether or not the ?? null
-// reads are actually there. ---
-
-$redis->delete($processingKey, $pendingKey);
-
-/** @var array{class: class-string<Job>, args: array<string, mixed>, attempts: int, maxAttempts: int|null} $legacyFields */
-$legacyFields = [
-    'class' => AtomicTransitionJob::class,
-    'args' => ['message' => 'pre-id-envelope'],
-    'attempts' => 0,
-    'maxAttempts' => null,
-];
-$legacyPayload = json_encode($legacyFields, JSON_THROW_ON_ERROR);
-$redis->getList($processingKey)->pushHead($legacyPayload);
-
-$legacyJob = new QueuedJob(
-    AtomicTransitionJob::class,
-    ['message' => 'pre-id-envelope'],
-    handle: $legacyPayload,
-    queue: 'atomic-release',
-    attempts: 1,
-    maxAttempts: null,
-);
-
-set_error_handler(static function (int $errno, string $errstr): never {
-    throw new ErrorException($errstr);
-});
-
-try {
-    $queue->release($legacyJob);
-    $legacyReleaseSucceeded = true;
-} catch (Throwable $e) {
-    $legacyReleaseSucceeded = false;
-    echo 'legacy-envelope release() threw: ' . $e::class . ': ' . $e->getMessage() . "\n";
-} finally {
-    restore_error_handler();
-}
-
-check('legacy-envelope: release() of a pre-id payload succeeds under a warning-to-exception handler', $legacyReleaseSucceeded);
-check('legacy-envelope: nothing left in processing', $redis->getList($processingKey)->getSize() === 0);
-
-$pendingAfterLegacyRelease = $redis->getList($pendingKey)->getRange();
-check('legacy-envelope: exactly one pending entry after release', count($pendingAfterLegacyRelease) === 1);
-
-/** @var array{id: string, pushedAt: int} $upgradedEnvelope */
-$upgradedEnvelope = json_decode($pendingAfterLegacyRelease[0], true, flags: JSON_THROW_ON_ERROR);
-check('legacy-envelope: the released payload gained a real id', is_string($upgradedEnvelope['id']) && $upgradedEnvelope['id'] !== '');
-check('legacy-envelope: the released payload gained a real pushedAt', is_int($upgradedEnvelope['pushedAt']) && $upgradedEnvelope['pushedAt'] > 0);
 
 // --- promoteDelayedJobs(): delayed -> pending. ---
 

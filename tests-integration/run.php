@@ -135,6 +135,16 @@ function runPrioritySweepTimingCheck(QueueInterface $queue): void
  * prove the exact-payload LREM this backend's settle callback issues
  * genuinely finds and removes the entry, leaving the processing list
  * truly empty rather than merely appearing to under a fake.
+ *
+ * Every case below is a complete, current envelope with exactly one
+ * field corrupted, so what it proves is that field's own rule and not
+ * some earlier check firing first. The identity and required-key cases
+ * — a missing `metadata`, an `id` outside the 32-lowercase-hex shape
+ * push() writes, a `pushedAt` stored as a numeric string or as a
+ * non-positive timestamp — are the ones a looser decoder would accept
+ * as a job, which is why each is walked all the way through a real
+ * reservation to a real settlement here rather than only at the unit
+ * level.
  */
 function runMalformedMessageChecks(RedisClient $redis, RedisQueue $queue): void
 {
@@ -144,21 +154,49 @@ function runMalformedMessageChecks(RedisClient $redis, RedisQueue $queue): void
     $pendingKey = "kinetis_queue:{$queueName}:pending";
     $processingKey = "kinetis_queue:{$queueName}:processing";
 
-    $malformedPayload = json_encode(['class' => 'Some\\Job', 'args' => 'not an array', 'attempts' => 0, 'maxAttempts' => null]);
-    $redis->getList($pendingKey)->pushHead($malformedPayload);
+    $envelope = static function (array $overrides = [], array $missing = []): string {
+        $envelope = [
+            'id' => bin2hex(random_bytes(16)),
+            'pushedAt' => time(),
+            'class' => 'Some\\Job',
+            'args' => [],
+            'attempts' => 0,
+            'maxAttempts' => null,
+            'metadata' => [],
+            ...$overrides,
+        ];
 
-    $threw = null;
+        foreach ($missing as $field) {
+            unset($envelope[$field]);
+        }
 
-    try {
-        $queue->pop(timeoutSeconds: 1, queues: [$queueName]);
-    } catch (MalformedJobSettledException $e) {
-        $threw = $e;
+        return json_encode($envelope, JSON_THROW_ON_ERROR);
+    };
+
+    $cases = [
+        'an args field that is not an array' => $envelope(['args' => 'not an array']),
+        'a missing metadata key' => $envelope(missing: ['metadata']),
+        'an id that is not 32 lowercase hex characters' => $envelope(['id' => 'not-a-current-id']),
+        'a pushedAt stored as a numeric string' => $envelope(['pushedAt' => (string) time()]),
+        'a pushedAt of zero' => $envelope(['pushedAt' => 0]),
+    ];
+
+    foreach ($cases as $label => $malformedPayload) {
+        $redis->getList($pendingKey)->pushHead($malformedPayload);
+
+        $threw = null;
+
+        try {
+            $queue->pop(timeoutSeconds: 1, queues: [$queueName]);
+        } catch (MalformedJobSettledException $e) {
+            $threw = $e;
+        }
+
+        check("RedisQueue: pop() throws MalformedJobSettledException for a reserved message with {$label}", $threw !== null);
+        check("RedisQueue: the settled exception names the right queue for {$label}", $threw?->queue === $queueName);
+        check("RedisQueue: nothing left in processing after {$label} — the poison payload was removed, not stranded", $redis->getList($processingKey)->getSize() === 0);
+        check("RedisQueue: nothing left in pending either after {$label}", $redis->getList($pendingKey)->getSize() === 0);
     }
-
-    check('RedisQueue: pop() throws MalformedJobSettledException for a malformed reserved message', $threw !== null);
-    check('RedisQueue: the settled exception names the right queue', $threw?->queue === $queueName);
-    check('RedisQueue: nothing left in processing — the poison payload was genuinely removed, not stranded', $redis->getList($processingKey)->getSize() === 0);
-    check('RedisQueue: nothing left in pending either', $redis->getList($pendingKey)->getSize() === 0);
 
     // The loop must genuinely continue: a real, well-formed job pushed to
     // the same queue right after is still poppable normally.
