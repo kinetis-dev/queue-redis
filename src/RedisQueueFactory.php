@@ -6,7 +6,7 @@ namespace Kinetis\QueueRedis;
 
 use InvalidArgumentException;
 use Kinetis\Config\Config;
-use Kinetis\Queue\QueueInterface;
+use Kinetis\Queue\ClearableQueueInterface;
 use Kinetis\SimpleCache\RedisSimpleCache;
 
 use function Amp\Redis\createRedisClient;
@@ -17,10 +17,14 @@ use function Amp\Redis\createRedisClient;
  * behind a `class_exists()` check so core never depends on this package
  * directly, the same pattern used for every other optional queue
  * backend (`kinetis/queue-sqs`, `kinetis/queue-rabbitmq`).
+ *
+ * Returns `ClearableQueueInterface`, the capability this backend
+ * declares; see `QueueFactory` for why the connection-driven factory
+ * stays on `QueueInterface`.
  */
 final class RedisQueueFactory
 {
-    public static function fromConfig(Config $config, string $connectionName = 'default'): QueueInterface
+    public static function fromConfig(Config $config, string $connectionName = 'default'): ClearableQueueInterface
     {
         $redisConfig = RedisSimpleCache::buildRedisConfig($config, $connectionName);
 

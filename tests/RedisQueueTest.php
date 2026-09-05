@@ -4,14 +4,20 @@ declare(strict_types=1);
 
 namespace Kinetis\QueueRedis\Tests;
 
+use Amp\Redis\RedisClient;
+use Kinetis\Queue\ClearableQueueInterface;
 use Kinetis\Queue\Exception\InvalidDelaySecondsException;
 use Kinetis\Queue\Exception\InvalidMaxAttemptsException;
 use Kinetis\Queue\Exception\InvalidQueueNameException;
 use Kinetis\Queue\Exception\MalformedQueuedJobDataException;
+use Kinetis\Queue\Exception\StaleJobHandleException;
 use Kinetis\Queue\JobSerializer;
+use Kinetis\Queue\JobSettlement;
+use Kinetis\Queue\QueuedJob;
 use Kinetis\QueueRedis\RedisQueue;
 use Kinetis\QueueRedis\Tests\Fixtures\Priority;
 use Kinetis\QueueRedis\Tests\Fixtures\RichPayloadJob;
+use Kinetis\QueueRedis\Tests\Fixtures\ScriptedRedisLink;
 use PHPUnit\Framework\TestCase;
 use ReflectionMethod;
 use function Amp\Redis\createRedisClient;
@@ -37,6 +43,14 @@ use function Amp\Redis\createRedisClient;
  * only opens on the first command actually executed — so a RedisClient
  * pointed at localhost with nothing listening is safe to construct and
  * pass to RedisQueue here with no real server required.
+ *
+ * ack()/fail()/clear() are the exception to "never unit-tested against a
+ * fake", and the reason is what they test: not that Redis removes an
+ * entry — only a real server proves that — but which command this class
+ * issues, against which keys, and what it makes of the reply. That is
+ * pure request-building and branching over one integer, and
+ * Amp\Redis\Connection\RedisLink is the seam that supplies both (see
+ * {@see ScriptedRedisLink}).
  */
 final class RedisQueueTest extends TestCase
 {
@@ -450,5 +464,162 @@ final class RedisQueueTest extends TestCase
         self::assertSame($serialized['args'], $queuedJob->args);
         self::assertIsFloat($queuedJob->args['ratio']);
         self::assertSame(4.0, $queuedJob->args['ratio']);
+    }
+
+    /**
+     * The delivery a settlement names, with $handle the exact envelope
+     * string ack()/fail() hand to LREM.
+     */
+    private static function delivery(string $payload = '{"job":"payload"}'): QueuedJob
+    {
+        return new QueuedJob(RichPayloadJob::class, [], handle: $payload, queue: 'default');
+    }
+
+    /**
+     * @param array<string, int|string|list<mixed>|null> $replies
+     * @return array{RedisQueue, ScriptedRedisLink}
+     */
+    private static function scriptedQueue(array $replies): array
+    {
+        $link = new ScriptedRedisLink($replies);
+
+        return [new RedisQueue(new RedisClient($link)), $link];
+    }
+
+    public function test_ack_removes_the_reserved_delivery_from_the_processing_list(): void
+    {
+        [$queue, $link] = self::scriptedQueue(['lrem' => 1]);
+
+        $queue->ack(self::delivery());
+
+        self::assertSame(
+            [['lrem', ['kinetis_queue:default:processing', 1, '{"job":"payload"}']]],
+            $link->commands,
+        );
+    }
+
+    /**
+     * LREM removing nothing means the processing list holds no entry for
+     * this handle: the delivery was settled through another call, or
+     * reclaimed. Reporting success would tell a worker its job is durably
+     * done when nothing was written.
+     */
+    public function test_ack_rejects_a_handle_whose_delivery_is_already_over(): void
+    {
+        [$queue] = self::scriptedQueue(['lrem' => 0]);
+
+        try {
+            $queue->ack(self::delivery());
+            self::fail('Expected the stale delivery to be rejected.');
+        } catch (StaleJobHandleException $e) {
+            self::assertSame(JobSettlement::Ack, $e->operation);
+            self::assertStringContainsString('default', $e->getMessage());
+        }
+    }
+
+    public function test_fail_removes_the_reserved_delivery_from_the_processing_list(): void
+    {
+        [$queue, $link] = self::scriptedQueue(['lrem' => 1]);
+
+        $queue->fail(self::delivery());
+
+        self::assertSame(
+            [['lrem', ['kinetis_queue:default:processing', 1, '{"job":"payload"}']]],
+            $link->commands,
+        );
+    }
+
+    /**
+     * fail() carries its own operation on the exception, not ack()'s —
+     * QueueWorker reports a lost settlement by which one it attempted.
+     */
+    public function test_fail_rejects_a_handle_whose_delivery_is_already_over(): void
+    {
+        [$queue] = self::scriptedQueue(['lrem' => 0]);
+
+        try {
+            $queue->fail(self::delivery());
+            self::fail('Expected the stale delivery to be rejected.');
+        } catch (StaleJobHandleException $e) {
+            self::assertSame(JobSettlement::Fail, $e->operation);
+        }
+    }
+
+    /**
+     * One EVAL, not an LLEN/ZCARD pair followed by a DEL: a job pushed
+     * between a separate count and delete would be removed without being
+     * counted. Amp\Redis\RedisClient::eval() puts the script on the wire
+     * as EVALSHA, so the recorded command carries the script's hash, the
+     * key count, and then the keys themselves.
+     */
+    public function test_clear_counts_and_deletes_in_one_script_over_the_pending_and_delayed_keys(): void
+    {
+        [$queue, $link] = self::scriptedQueue(['evalsha' => 7]);
+
+        self::assertSame(7, $queue->clear('high'));
+
+        self::assertCount(1, $link->commands, 'counting and deleting are one round trip');
+        [$command, $parameters] = $link->commands[0];
+
+        self::assertSame('evalsha', $command);
+        self::assertSame(2, $parameters[1], 'the script declares exactly two keys');
+        self::assertSame(
+            ['kinetis_queue:high:pending', 'kinetis_queue:high:delayed'],
+            \array_slice($parameters, 2),
+        );
+    }
+
+    /**
+     * The processing list holds deliveries workers own, and clearing must
+     * never reach it — asserted over every parameter that went to the
+     * wire rather than over the two keys the test above names, so a third
+     * key added later fails here too.
+     */
+    public function test_clear_never_addresses_the_processing_list(): void
+    {
+        [$queue, $link] = self::scriptedQueue(['evalsha' => 0]);
+
+        $queue->clear('high');
+
+        foreach ($link->commands[0][1] as $parameter) {
+            self::assertStringNotContainsString('processing', (string) $parameter);
+        }
+    }
+
+    /**
+     * A malformed name is turned away before any command reaches Redis —
+     * proven by the empty command log, not merely by an unreachable
+     * server refusing the connection.
+     */
+    public function test_clear_validates_the_queue_name_before_issuing_any_command(): void
+    {
+        [$queue, $link] = self::scriptedQueue(['evalsha' => 0]);
+
+        try {
+            $queue->clear('has spaces');
+            self::fail('Expected the malformed queue name to be rejected.');
+        } catch (InvalidQueueNameException) {
+            self::assertSame([], $link->commands);
+        }
+    }
+
+    public function test_the_backend_is_usable_through_the_clear_capability_type(): void
+    {
+        $queue = $this->neverConnectedQueue();
+
+        self::assertInstanceOf(ClearableQueueInterface::class, $queue);
+
+        // Called through the capability type, not the concrete class: a
+        // backend that stopped declaring ClearableQueueInterface fails
+        // here as a TypeError instead of passing quietly. The queue-name
+        // check still throws before Redis is touched.
+        $this->expectException(InvalidQueueNameException::class);
+        self::clearThrough($queue, '');
+    }
+
+    /** Typed as the capability, which is the whole point of the test above. */
+    private static function clearThrough(ClearableQueueInterface $queue, string $name): int
+    {
+        return $queue->clear($name);
     }
 }

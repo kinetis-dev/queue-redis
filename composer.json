@@ -10,8 +10,8 @@
     ],
     "require": {
         "php": "^8.4",
-        "kinetis/framework": "^1.3.0",
-        "kinetis/queue": "^1.1.4",
+        "kinetis/framework": "^1.3.1",
+        "kinetis/queue": "^1.2.0",
         "kinetis/cache-redis": "^1.1.9",
         "amphp/redis": "^2.0.4"
     },
