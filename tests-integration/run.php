@@ -12,8 +12,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/../vendor/autoload.php';
 
-use Kinetis\Queue\Exception\InvalidPopTimeoutException;
-use Kinetis\Queue\Exception\InvalidQueueNameException;
+use Kinetis\Queue\Exception\InvalidQueueArgumentException;
 use Kinetis\Queue\Exception\MalformedJobSettledException;
 use Kinetis\Queue\Job;
 use Kinetis\Queue\QueuedJob;
@@ -86,17 +85,12 @@ function runQueueChecks(string $backend, QueueInterface $queue): void
 }
 
 /**
- * The real fix under KINETIS-18: an empty higher-priority queue must
- * never delay finding a job already waiting in a lower-priority one —
- * the old per-queue BRPOPLPUSH loop cost a full
- * PER_QUEUE_POLL_TIMEOUT_SECONDS (1 real second) per empty queue checked
- * before it moved on, so three empty queues ahead of a ready one meant a
- * multi-second wait even though the job was there the whole time.
- * pop()'s own immediate, non-blocking sweep (backed by probeNonBlocking()'s
- * atomic Lua RPOP+LPUSH, never amphp/redis's buggy non-nullable
- * popTailPushHead() wrapper) is what closes that — verified here by
- * timing a real pop() across three genuinely empty higher-priority
- * queues, on a real Redis, not asserted from the algorithm alone.
+ * An empty higher-priority queue must never delay finding a job already
+ * waiting in a lower-priority one. pop()'s immediate, non-blocking sweep
+ * — backed by reserveImmediately()'s atomic Lua RPOP+LPUSH, never
+ * amphp/redis's non-nullable popTailPushHead() wrapper — is what gives
+ * that, and it is timed here against a real Redis across three empty
+ * higher-priority queues rather than asserted from the algorithm alone.
  */
 function runPrioritySweepTimingCheck(QueueInterface $queue): void
 {
@@ -109,7 +103,7 @@ function runPrioritySweepTimingCheck(QueueInterface $queue): void
     $elapsed = microtime(true) - $start;
 
     check(
-        'RedisQueue: a job in the last of four queues, the first three genuinely empty, is still found',
+        'RedisQueue: a job in the last of four queues, the first three empty, is still found',
         $found?->args['message'] === 'found-immediately',
     );
     check(
@@ -215,21 +209,21 @@ function runInputValidationChecks(QueueInterface $queue): void
     try {
         $queue->pop(timeoutSeconds: -1);
         check('RedisQueue: a negative timeout is rejected', false);
-    } catch (InvalidPopTimeoutException) {
+    } catch (InvalidQueueArgumentException) {
         check('RedisQueue: a negative timeout is rejected', true);
     }
 
     try {
         $queue->pop(queues: ['default', '']);
         check('RedisQueue: an empty queue name is rejected', false);
-    } catch (InvalidQueueNameException) {
+    } catch (InvalidQueueArgumentException) {
         check('RedisQueue: an empty queue name is rejected', true);
     }
 
     try {
         $queue->pop(queues: ['default', 'high', 'default']);
         check('RedisQueue: a duplicate queue name is rejected', false);
-    } catch (InvalidQueueNameException) {
+    } catch (InvalidQueueArgumentException) {
         check('RedisQueue: a duplicate queue name is rejected', true);
     }
 

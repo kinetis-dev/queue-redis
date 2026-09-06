@@ -14,124 +14,85 @@ use Kinetis\Queue\JobSerializer;
 use Kinetis\Queue\JobSettlement;
 use Kinetis\Queue\QueueContract;
 use Kinetis\Queue\QueuedJob;
-use Kinetis\Queue\Support\PopSweep;
-use LogicException;
 use Throwable;
 
 /**
- * A naive Redis list pop already removes the item at pop time — if a
- * worker crashes mid-job, it's just gone, no way to detect or retry. This
- * uses the "reliable queue" pattern instead: pop() atomically moves a
- * job's payload from a queue's pending list to a separate processing list
- * (popTailPushHeadBlocking() — genuinely BRPOPLPUSH, suspending the
- * calling Fiber via Revolt, not busy-polling) rather than deleting it
- * outright. ack() removes it from the processing list; release() moves it
- * back onto the pending list. This gives the same at-least-once
- * possibility SqlQueue's `reserved_at` column gives, not a silently
- * weaker guarantee just because the backend differs.
+ * A naive Redis list pop removes the item at pop time — a worker that
+ * crashes mid-job loses it with no way to detect or retry. This uses the
+ * reliable-queue pattern instead: pop() atomically moves a payload from a
+ * queue's pending list to a separate processing list, ack() removes it
+ * from there, release() moves it back. That gives the same at-least-once
+ * guarantee SqlQueue's `reserved_at` column gives.
  *
  * Every key is scoped by queue name (`kinetis_queue:{queue}:pending`,
  * `:processing`, `:delayed`) — named queues are genuinely separate Redis
- * lists/sorted sets, not one shared structure with a filter on top.
+ * structures, not one shared structure with a filter on top.
  *
- * pop($timeoutSeconds, $queues) delegates its whole priority/timeout
- * algorithm to Kinetis\Queue\Support\PopSweep — see that class and
- * QueueInterface's own docblock for the full cross-backend contract.
- * This class supplies exactly one thing PopSweep needs: probe(), a
- * single-queue check that can spend up to a given wait budget.
- *
- * probe() cannot use amphp/redis's non-blocking popTailPushHead() (plain
- * RPOPLPUSH) for PopSweep's own zero-wait, immediate phase — its declared
- * return type is non-nullable `string`, but Redis returns nil for an
- * empty source list, which throws a TypeError inside amphp/redis itself.
- * probeNonBlocking() instead runs its own small Lua script — an atomic,
- * genuinely non-blocking RPOP+LPUSH pair — bypassing that buggy wrapper
- * entirely while keeping the exact same reliable pending->processing
- * move semantics. For a real, positive wait budget, probeBlocking() uses
- * the correctly-nullable popTailPushHeadBlocking() instead — but never
- * with a literal 0 for the timeout: BRPOPLPUSH's own timeout=0 means
- * "block forever," the opposite of PopSweep's own "don't block at all"
- * meaning for a zero wait budget, so a sub-one-second remaining budget
- * (Redis's blocking primitives have no fractional timeout) is handled by
- * one more non-blocking probe instead of rounding either up (overshooting
- * the deadline) or down to a literal 0 (blocking forever).
+ * pop() sweeps every queue in priority order with a non-blocking reserve
+ * first, then suspends on the highest-priority queue for one second
+ * before sweeping again — see QueueInterface for the contract this
+ * meets. The immediate sweep cannot use amphp/redis's popTailPushHead()
+ * (RPOPLPUSH): its declared return type is non-nullable `string` and
+ * Redis answers nil on an empty list, which throws a TypeError inside
+ * amphp/redis. reserveImmediately() runs the equivalent RPOP+LPUSH as
+ * one Lua script instead. reserveBlocking() uses the correctly-nullable
+ * popTailPushHeadBlocking() and is never called with 0, which BRPOPLPUSH
+ * reads as "block forever".
  *
  * Deliberately not built: a reaper for jobs stuck in a processing list
- * because the worker that popped them crashed before ack()/release()
- * ever ran. That's a real gap, not an oversight — closing it needs a
- * visibility-timeout mechanism (a per-job "reserved at" timestamp plus a
- * periodic scan) this first cut doesn't have yet. A job in that state is
- * stranded, not lost — it's still sitting in the processing list, exactly
- * where a future reaper would find it.
+ * because the worker that popped them died before settling. That needs a
+ * visibility-timeout mechanism this backend does not have. Such a job is
+ * stranded, not lost — it is still in the processing list, exactly where
+ * a reaper would find it.
  *
- * Two other transitions could otherwise lose a job outright: release()
- * (processing -> pending) and promoteDelayedJobs() (delayed -> pending)
- * both run as a single Lua script (eval()), which Redis executes as one
- * indivisible unit — a naive remove-then-push pair of separate commands
- * would leave a job removed from the source with nothing ever written to
- * the destination if a process crashed between them. No other command,
- * including a second worker's own concurrent promotion, can observe or
- * interleave with a partially-applied script, and a client that dies
- * before or after the call can never observe a state where the job
- * exists in neither list, only "still in the source" or "already in the
- * destination".
+ * release() and promoteDelayedJobs() each run as a single Lua script.
+ * Redis executes one as an indivisible unit, so a crash can never leave
+ * a job removed from the source with nothing written to the destination,
+ * and a concurrent worker cannot observe a partially applied script.
  *
- * Indivisible isn't the same as conditional, and release() needs both:
- * its script only performs the LPUSH when the LREM actually found and
- * removed the source entry (returning that count so the PHP side can
- * tell), so a second release() call with the same handle — a duplicate
- * call, a stale QueuedJob, or a retry after a connection drop whose
- * server-side outcome is unknown — throws Exception\StaleJobHandleException
- * instead of writing a second replacement onto pending. promoteDelayedJobs()
- * doesn't need the same guard: it has no caller-supplied handle to go
- * stale, only a self-contained read-and-move over whatever's currently
- * ready, so two concurrent calls simply serialize through Redis with
- * nothing left for the second to double-process.
+ * Indivisible is not the same as conditional, and release() needs both:
+ * its script performs the LPUSH only when the LREM actually removed the
+ * source entry, so a duplicate release() — a stale QueuedJob, a retry
+ * after a connection drop with an unknown server-side outcome — raises
+ * Exception\StaleJobHandleException instead of writing a second copy onto
+ * pending. promoteDelayedJobs() needs no such guard: it has no
+ * caller-supplied handle to go stale.
  *
- * All three settlements are fenced against a delivery that is already
- * over. LREM reports how many entries it removed, so ack() and fail()
- * read that count the same way release()'s script returns its own: a
- * zero means the processing list held no entry for this handle, and the
- * settlement raises Exception\StaleJobHandleException rather than
- * reporting a removal that never happened. QueuedJob's own docblock
- * states the delivery-receipt contract this meets.
+ * All three settlements are fenced the same way. LREM reports how many
+ * entries it removed, so a zero means this delivery is over and the
+ * settlement raises StaleJobHandleException rather than reporting a
+ * removal that never happened. The malformed-message path settles
+ * through the same LREM without reading the count back: that message was
+ * reserved moments earlier by this very call, so there is no stale
+ * delivery to report.
  *
- * The malformed-message path settles through the same LREM without
- * reading it back: the message it settles was reserved moments earlier
- * by this very call, so there is no stale delivery to report and pop()
- * raises Exception\MalformedQueuedJobDataException instead.
+ * Every envelope carries a random `id`. Two pushes of byte-identical job
+ * data would otherwise produce the same JSON string, and a sorted set's
+ * members are unique, so a delayed duplicate would collapse onto the
+ * first. release() preserves the `id`/`pushedAt` it reads off the
+ * envelope it replaces: uniqueness only has to hold between independent
+ * pushes, and regenerating either would erase the job's logical identity
+ * and original enqueue time.
  *
- * Every envelope carries a cryptographically random `id`, generated fresh
- * for an independent push(): two pushes with byte-identical job data
- * would otherwise produce the exact same JSON string, and a Redis sorted
- * set's members are unique, so the second push() of a delayed duplicate
- * would collapse onto the first instead of creating a second entry.
- * release() preserves the `id`/`pushedAt` it reads off the envelope it's
- * replacing rather than regenerating them — uniqueness only ever has to
- * hold *between* independent pushes, and regenerating on every retry
- * would erase the job's own logical identity and original enqueue time
- * for no benefit.
- *
- * Redis has no per-job columns the way SqlQueue has an `attempts` column,
- * so attempts/maxAttempts travel inside the JSON payload itself. The
- * envelope is exactly {id, pushedAt, class, args, attempts, maxAttempts,
- * metadata}, reread and rewritten by release() on every retry, and all
- * seven keys are required — `metadata` included, whose absence is a
- * truncated envelope rather than "no metadata was stored".
- * decodeQueuedJob() validates every one of them before a QueuedJob
- * exists, each against the shape encode() writes rather than the widest
- * shape a cross-backend coercer accepts: `id` is 32 lowercase
- * hexadecimal characters, and `pushedAt` a positive Unix timestamp that
- * json_decode() returned as a native integer. An envelope missing or
- * corrupting any of them settles through
- * QueueContract::settleIfMalformed() instead of reaching ack()/release()
- * as a partially accepted job. The stored `attempts` value is the number
- * of *completed* attempts (0 at push time); QueuedJob::$attempts is
- * always that value plus one.
+ * Redis has no per-job columns, so bookkeeping travels inside the JSON
+ * payload: the envelope is exactly {id, pushedAt, class, args, attempts,
+ * maxAttempts, metadata} and all seven keys are required — `metadata`
+ * included, whose absence means a truncated envelope rather than "none
+ * was stored". decodeQueuedJob() validates each against the shape
+ * encode() writes before a QueuedJob exists; anything else settles
+ * through QueueContract::settleIfMalformed(). The stored `attempts` is
+ * the number of *completed* attempts (0 at push time); QueuedJob::$attempts
+ * is that value plus one.
  */
 final readonly class RedisQueue implements ClearableQueueInterface
 {
-    private const PER_QUEUE_POLL_TIMEOUT_SECONDS = 1;
+    /**
+     * How long pop() suspends on the highest-priority queue when nothing
+     * is waiting anywhere. Redis's blocking primitives take whole
+     * seconds only, and 0 means "block forever", so one second is the
+     * shortest wait available.
+     */
+    private const int BLOCK_SECONDS = 1;
 
     /**
      * A ceiling on how many delayed jobs promoteDelayedJobs() moves in one
@@ -200,38 +161,60 @@ final readonly class RedisQueue implements ClearableQueueInterface
     #[\Override]
     public function pop(int $timeoutSeconds = 0, array $queues = ['default']): ?QueuedJob
     {
-        // PopSweep::run() itself validates $timeoutSeconds/$queues via
-        // QueueContract before touching either — see that class's own
-        // docblock for why it doesn't trust a caller to have already
-        // done so.
-        return PopSweep::run(
-            timeoutSeconds: $timeoutSeconds,
-            queues: $queues,
-            probe: function (string $queue, float $waitSeconds): ?QueuedJob {
+        QueueContract::assertValidPopArguments($timeoutSeconds, $queues);
+
+        if ($queues === []) {
+            return null;
+        }
+
+        $deadline = $timeoutSeconds > 0 ? microtime(true) + $timeoutSeconds : null;
+
+        while (true) {
+            foreach ($queues as $queue) {
                 $this->promoteDelayedJobs($queue);
 
-                return $waitSeconds < 1.0
-                    ? $this->probeNonBlocking($queue)
-                    : $this->probeBlocking($queue, (int) floor($waitSeconds));
-            },
-            probeCanBlock: true,
-            waitCapSeconds: (float) self::PER_QUEUE_POLL_TIMEOUT_SECONDS,
-            sleep: static function (): never {
-                throw new LogicException('RedisQueue never paces via sleep() — every probe either blocks natively or is instant.');
-            },
-        );
+                $job = $this->reserveImmediately($queue);
+
+                if ($job !== null) {
+                    return $job;
+                }
+            }
+
+            if ($deadline !== null && microtime(true) >= $deadline) {
+                return null;
+            }
+
+            // Nothing waiting anywhere, so suspend on the highest-priority
+            // queue rather than spinning. Delayed promotion and the
+            // lower-priority queues are re-checked on the next sweep.
+            // BRPOPLPUSH counts whole seconds and reads 0 as "block
+            // forever", so the wait is a fixed one second rather than
+            // what is left of the deadline.
+            $job = $this->reserveBlocking($queues[0], self::BLOCK_SECONDS);
+
+            if ($job !== null) {
+                return $job;
+            }
+
+            // That wait can consume the rest of the deadline on its own.
+            // Rechecking here, rather than only at the top of the next
+            // sweep, keeps an expired deadline from reserving a job the
+            // caller has already stopped waiting for — a reservation
+            // nothing would settle until it was reclaimed.
+            if ($deadline !== null && microtime(true) >= $deadline) {
+                return null;
+            }
+        }
     }
 
     /**
-     * The immediate, non-blocking half of probe() — an atomic RPOP+LPUSH
-     * pair run as one Lua script, never amphp/redis's own buggy
-     * popTailPushHead() wrapper (see this class's own docblock for why).
-     * `redis.call('RPOP', ...)` returning nothing becomes a Lua `false`,
-     * which the RESP protocol reports back as a null bulk reply —
-     * $this->redis->eval() itself is typed `mixed`, so unlike the buggy
-     * wrapper there's no non-nullable-string coercion to trip over here.
+     * An atomic RPOP+LPUSH pair as one Lua script — the same reliable
+     * pending-to-processing move, without amphp/redis's non-nullable
+     * popTailPushHead() wrapper. A Lua `false` from an empty list comes
+     * back as a RESP null bulk reply, and eval() is typed `mixed`, so
+     * there is no coercion to trip over.
      */
-    private function probeNonBlocking(string $queue): ?QueuedJob
+    private function reserveImmediately(string $queue): ?QueuedJob
     {
         $payload = $this->redis->eval(
             <<<'LUA'
@@ -260,15 +243,11 @@ final readonly class RedisQueue implements ClearableQueueInterface
     }
 
     /**
-     * The bounded-wait half of probe() — a genuine BRPOPLPUSH, blocking
-     * for up to $waitSeconds real seconds. Never called with 0: Redis's
-     * own blocking primitives treat a literal 0 timeout as "block
-     * forever," not "don't block at all" — probe()'s own dispatch routes
-     * anything below one second (where that ambiguity would otherwise
-     * bite, since these primitives have no fractional timeout either) to
-     * probeNonBlocking() instead.
+     * A genuine BRPOPLPUSH, suspending the calling Fiber through Revolt
+     * for up to $waitSeconds. Never called with 0, which Redis reads as
+     * "block forever".
      */
-    private function probeBlocking(string $queue, int $waitSeconds): ?QueuedJob
+    private function reserveBlocking(string $queue, int $waitSeconds): ?QueuedJob
     {
         $payload = $this->redis->getList(self::pendingKey($queue))
             ->popTailPushHeadBlocking(self::processingKey($queue), $waitSeconds);
@@ -287,62 +266,39 @@ final readonly class RedisQueue implements ClearableQueueInterface
     }
 
     /**
-     * Every field is read through one of QueueContract's own coercion
-     * helpers rather than trusted at a PHPStan-asserted @var shape — a
-     * hand-edited or otherwise corrupted JSON payload could carry
-     * anything, from a body that isn't even valid JSON to a `class`
-     * field that's missing, an `args` field that isn't an array, or an
-     * `attempts`/`maxAttempts` value that isn't a clean integer.
-     * attempts specifically goes through coerceStoredCompletedAttempts(),
-     * not the plain coerceStoredInteger() maxAttempts uses — this stored
-     * value is the completed-attempts count (0-indexed) that gets a real
-     * `+ 1` right below, and that method is what keeps a stored
-     * PHP_INT_MAX from silently overflowing that addition into a float,
-     * and also rejects a negative stored count outright — a value that
-     * parses cleanly but would otherwise produce a final attempts value
-     * below QueuedJob's own 1-indexed floor. maxAttempts is checked for
-     * *presence* first — QueueContract::assertFieldPresent() — since
-     * encode() below always writes this key, even when its own value is
-     * null; only a genuinely missing key is a sign of a truncated
-     * envelope, which a plain `?? null` read could never distinguish
-     * from a present, legitimately-null value. `metadata` gets the same
-     * presence check before its own shape is coerced, and for the same
-     * reason: coerceStoredMetadata() reads an absent value as an empty
-     * map — the right reading for the backends that write the field only
-     * when a caller supplied metadata — so a missing key here would
-     * otherwise decode into an accepted job. encode() always writes it,
-     * so presence has to be established separately. `id` and `pushedAt`
-     * go through envelopeIdentity() below, which checks presence and
-     * then the exact shape this encoder writes, before any QueuedJob
-     * exists — so an envelope missing or corrupting either one settles
-     * here rather than being accepted as a job whose release() would
-     * then have no identity to preserve. Every failure here is
-     * caught by this class's own probeNonBlocking()/probeBlocking() —
-     * see QueueContract::settleIfMalformed() — so a malformed payload
-     * settles the already-reserved message rather than crashing the
-     * worker.
+     * Every field goes through a QueueContract helper rather than a
+     * PHPStan-asserted shape: a corrupted payload could carry anything.
+     * `attempts` is the completed-attempts count that gets a `+ 1` right
+     * below, so its upper bound keeps a stored PHP_INT_MAX from
+     * overflowing that addition into a float. `maxAttempts` and
+     * `metadata` are checked for *presence* first, since encode() always
+     * writes both keys and a legitimately-null or empty value is
+     * indistinguishable from a truncated envelope through a `?? null`
+     * read alone. Every failure here is caught by the caller through
+     * QueueContract::settleIfMalformed(), so a malformed payload settles
+     * the already-reserved message instead of crashing the worker.
      */
     private function decodeQueuedJob(string $queue, string $payload): QueuedJob
     {
-        $decoded = QueueContract::coerceStoredJsonArray($payload, 'payload');
+        $decoded = QueueContract::storedJsonArray($payload, 'payload');
 
         self::envelopeIdentity($decoded);
 
-        $class = QueueContract::coerceStoredClass($decoded['class'] ?? null);
-        $args = QueueContract::coerceStoredArgs($decoded['args'] ?? null);
+        $class = QueueContract::storedClass($decoded['class'] ?? null);
+        $args = QueueContract::storedArgs($decoded['args'] ?? null);
 
         QueueContract::assertFieldPresent($decoded, 'metadata');
-        $metadata = QueueContract::coerceStoredMetadata($decoded['metadata']);
+        $metadata = QueueContract::storedMetadata($decoded['metadata']);
 
         QueueContract::assertFieldPresent($decoded, 'maxAttempts');
-        $maxAttempts = QueueContract::coerceStoredMaxAttempts($decoded['maxAttempts'], 'maxAttempts');
+        $maxAttempts = QueueContract::storedNullableInt($decoded['maxAttempts'], 'maxAttempts', 0);
 
         return new QueuedJob(
             $class,
             $args,
             handle: $payload,
             queue: $queue,
-            attempts: QueueContract::coerceStoredCompletedAttempts($decoded['attempts'] ?? null, 'attempts') + 1,
+            attempts: QueueContract::storedInt($decoded['attempts'] ?? null, 'attempts', 0, PHP_INT_MAX - 1) + 1,
             maxAttempts: $maxAttempts,
             metadata: $metadata,
         );
@@ -374,7 +330,7 @@ final readonly class RedisQueue implements ClearableQueueInterface
         // this exact payload before handing back the QueuedJob whose
         // handle it is.
         [$id, $pushedAt] = self::envelopeIdentity(
-            QueueContract::coerceStoredJsonArray($oldPayload, 'payload'),
+            QueueContract::storedJsonArray($oldPayload, 'payload'),
         );
 
         $newPayload = self::encode(
@@ -472,13 +428,11 @@ final readonly class RedisQueue implements ClearableQueueInterface
     }
 
     /**
-     * Shared by settle() (a real QueuedJob's own handle/queue) and the
-     * malformed-message settlement path in probeNonBlocking()/
-     * probeBlocking() (the raw payload/queue a decode failure was
-     * caught for, with no QueuedJob to read them off of) — the same
-     * underlying LREM either way, just reached from two different
-     * starting shapes. The count is how many entries LREM removed: 1
-     * for a live reservation, 0 for a delivery that is already over.
+     * Shared by settle() (a real QueuedJob's handle and queue) and the
+     * malformed-message path (the raw payload a decode failure was
+     * caught for, with no QueuedJob to read either off). The count is
+     * how many entries LREM removed: 1 for a live reservation, 0 for a
+     * delivery that is already over.
      */
     private function removeFromProcessing(string $queue, string $payload): int
     {
@@ -515,30 +469,15 @@ final readonly class RedisQueue implements ClearableQueueInterface
     }
 
     /**
-     * The two identity fields of a current envelope, validated rather
-     * than read optionally: `id` is what keeps two byte-identical jobs
-     * from collapsing into one member of the delayed sorted set, and
-     * `pushedAt` is the job's original enqueue time, which release()
-     * carries across every retry. Both are written by encode() on every
-     * push, so an envelope missing or corrupting either is corrupted
-     * storage — the same judgment decodeQueuedJob() already makes for
-     * `class`/`args`/`attempts`/`maxAttempts`/`metadata`, reached
-     * through the same MalformedQueuedJobDataException.
-     *
-     * Each is checked against the one shape this encoder writes, not the
-     * widest shape a value of that kind could take. `id` must match
-     * ID_PATTERN: push() writes bin2hex(random_bytes(16)), so a UUID's
-     * dashed form, uppercase hex, or a hex run of the wrong length came
-     * from somewhere else, and accepting one would mean release()
-     * carrying an identity the delayed sorted set's uniqueness never
-     * rested on. `pushedAt` must be a native integer as json_decode()
-     * returned it, and positive: push() writes time() as a JSON number,
-     * so a numeric string, a float, a bool, or a zero/negative timestamp
-     * is a value this format never stored.
-     * QueueContract::coerceStoredInteger() accepts the numeric-string
-     * form on purpose, since other backends keep the same bookkeeping in
-     * text columns and headers — which is why the narrower check belongs
-     * here rather than there.
+     * The two identity fields every envelope carries, validated rather
+     * than read optionally: `id` keeps two byte-identical jobs from
+     * collapsing into one member of the delayed sorted set, and
+     * `pushedAt` is the original enqueue time release() carries across
+     * every retry. Both are checked against the exact shape encode()
+     * writes — `id` is bin2hex(random_bytes(16)), `pushedAt` a positive
+     * Unix time json_decode() returned as a native integer — because
+     * accepting a wider shape here would mean release() carrying an
+     * identity the sorted set's uniqueness never rested on.
      *
      * @param array<array-key, mixed> $decoded
      * @return array{0: string, 1: int}
@@ -560,7 +499,7 @@ final readonly class RedisQueue implements ClearableQueueInterface
         }
 
         if ($pushedAt < 1) {
-            throw MalformedQueuedJobDataException::outOfBounds('pushedAt', $pushedAt, 'an enqueue timestamp must be a positive Unix time');
+            throw MalformedQueuedJobDataException::outOfBounds('pushedAt', 'an enqueue timestamp must be a positive Unix time');
         }
 
         return [$id, $pushedAt];

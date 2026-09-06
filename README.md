@@ -64,7 +64,11 @@ REDIS_HOST=127.0.0.1
 This package introduces no configuration keys of its own — `REDIS_HOST`/
 `REDIS_URL`/`REDIS_TLS`/... are the exact ones [`kinetis/cache-redis`](https://github.com/kinetis-dev/cache-redis)'s
 `RedisSimpleCache` already reads, scoped by `QUEUE_CONNECTION_NAME` the
-same way every other backend is. [`kinetis/queue`](https://github.com/kinetis-dev/queue)'s own keys
+same way every other backend is. `REDIS_CLUSTER` is not among them: this
+backend is single-node, and it opens its own connection over
+[`kinetis/redis`](https://github.com/kinetis-dev/redis) rather than
+sharing the cache's, since a blocking `BRPOPLPUSH` would stall every
+pipelined command on a shared socket. [`kinetis/queue`](https://github.com/kinetis-dev/queue)'s own keys
 (`QUEUE_CONNECTION`, `QUEUE_MAX_ATTEMPTS`, ...) are documented in that
 package; full reference:
 [kinetis.dev/docs/config.html](https://kinetis.dev/docs/config.html).
@@ -76,7 +80,7 @@ composer require kinetis/queue-redis
 ```
 
 Requires PHP 8.4+, [`kinetis/framework`](https://github.com/kinetis-dev/framework), [`kinetis/queue`](https://github.com/kinetis-dev/queue), and
-[`kinetis/cache-redis`](https://github.com/kinetis-dev/cache-redis). Full documentation:
+[`kinetis/redis`](https://github.com/kinetis-dev/redis). Full documentation:
 [kinetis.dev/docs/queue-redis.html](https://kinetis.dev/docs/queue-redis.html).
 
 ## License

@@ -5,10 +5,8 @@ declare(strict_types=1);
 namespace Kinetis\QueueRedis\Tests;
 
 use Amp\Redis\RedisClient;
+use Kinetis\Queue\Exception\InvalidQueueArgumentException;
 use Kinetis\Queue\ClearableQueueInterface;
-use Kinetis\Queue\Exception\InvalidDelaySecondsException;
-use Kinetis\Queue\Exception\InvalidMaxAttemptsException;
-use Kinetis\Queue\Exception\InvalidQueueNameException;
 use Kinetis\Queue\Exception\MalformedQueuedJobDataException;
 use Kinetis\Queue\Exception\StaleJobHandleException;
 use Kinetis\Queue\JobSerializer;
@@ -128,7 +126,7 @@ final class RedisQueueTest extends TestCase
     {
         $queue = $this->neverConnectedQueue();
 
-        $this->expectException(InvalidQueueNameException::class);
+        $this->expectException(InvalidQueueArgumentException::class);
         $queue->size('');
     }
 
@@ -136,7 +134,7 @@ final class RedisQueueTest extends TestCase
     {
         $queue = $this->neverConnectedQueue();
 
-        $this->expectException(InvalidQueueNameException::class);
+        $this->expectException(InvalidQueueArgumentException::class);
         $queue->size('has spaces');
     }
 
@@ -144,7 +142,7 @@ final class RedisQueueTest extends TestCase
     {
         $queue = $this->neverConnectedQueue();
 
-        $this->expectException(InvalidQueueNameException::class);
+        $this->expectException(InvalidQueueArgumentException::class);
         $queue->clear('');
     }
 
@@ -152,7 +150,7 @@ final class RedisQueueTest extends TestCase
     {
         $queue = $this->neverConnectedQueue();
 
-        $this->expectException(InvalidDelaySecondsException::class);
+        $this->expectException(InvalidQueueArgumentException::class);
         $queue->push(new RichPayloadJob(4.0, [], Priority::High), delaySeconds: -1);
     }
 
@@ -160,7 +158,7 @@ final class RedisQueueTest extends TestCase
     {
         $queue = $this->neverConnectedQueue();
 
-        $this->expectException(InvalidMaxAttemptsException::class);
+        $this->expectException(InvalidQueueArgumentException::class);
         $queue->push(new RichPayloadJob(4.0, [], Priority::High), maxAttempts: -1);
     }
 
@@ -168,7 +166,7 @@ final class RedisQueueTest extends TestCase
      * decodeQueuedJob()'s own $decoded['attempts']/['maxAttempts'] read is
      * where a corrupted JSON payload's malformed value is actually caught
      * — proven directly with a hand-built payload, not merely at
-     * QueueContract::coerceStoredInteger()'s own unit level, so the wiring
+     * QueueContract::storedInt()'s own unit level, so the wiring
      * between the two is exercised too.
      */
     public function test_decode_queued_job_rejects_a_non_numeric_stored_attempts_value(): void
@@ -196,14 +194,10 @@ final class RedisQueueTest extends TestCase
     }
 
     /**
-     * The reviewer's own reported overflow gap, at the real decode level:
-     * a stored completed-attempts count of exactly PHP_INT_MAX is
-     * syntactically a perfectly valid integer — coerceStoredInteger()
-     * alone would accept it — but decodeQueuedJob()'s own `+ 1` would
-     * silently overflow it to a float, which would then fail QueuedJob's
-     * strictly-typed constructor with a confusing TypeError. This proves
-     * the real, wired decode path rejects it cleanly instead, via
-     * QueueContract::coerceStoredCompletedAttempts().
+     * A stored completed-attempts count of exactly PHP_INT_MAX is a
+     * valid integer, but decodeQueuedJob()'s `+ 1` would overflow it to
+     * a float and fail QueuedJob's typed constructor with a TypeError.
+     * The decode path rejects it as corrupted storage instead.
      */
     public function test_decode_queued_job_rejects_a_stored_attempts_value_of_php_int_max(): void
     {
@@ -213,7 +207,7 @@ final class RedisQueueTest extends TestCase
         $decodeQueuedJob = new ReflectionMethod(RedisQueue::class, 'decodeQueuedJob');
 
         $this->expectException(MalformedQueuedJobDataException::class);
-        $this->expectExceptionMessage('PHP_INT_MAX');
+        $this->expectExceptionMessage('"attempts"');
         $decodeQueuedJob->invoke($queue, 'default', $payload);
     }
 
@@ -256,8 +250,8 @@ final class RedisQueueTest extends TestCase
      * real, distinct malformed shape from "not an array at all" above —
      * is_array() alone would have accepted it. Confirming it throws
      * MalformedQueuedJobDataException here, from decodeQueuedJob()
-     * itself (the exact function probeNonBlocking()/probeBlocking()
-     * wrap in QueueContract::settleIfMalformed()), is what proves this
+     * itself (the function reserveImmediately()/reserveBlocking() wrap
+     * in QueueContract::settleIfMalformed()), is what proves this
      * reaches the settle-and-remove path rather than QueueWorker's
      * ordinary job-execution failure handling (which would otherwise
      * release/retry a message that can never succeed, up to
@@ -385,7 +379,7 @@ final class RedisQueueTest extends TestCase
     /**
      * push() writes `pushedAt` as time(): a JSON number json_decode()
      * hands back as a native, positive integer. The numeric strings here
-     * are exactly what QueueContract::coerceStoredInteger() accepts for
+     * are exactly what QueueContract::storedInt() accepts for
      * the backends that keep the same bookkeeping in text columns and
      * headers — this envelope never stores one, so the decoder turns
      * them away alongside a float, a bool, a null, an array, and any
@@ -414,7 +408,7 @@ final class RedisQueueTest extends TestCase
     /**
      * encode() always writes the `metadata` key — an empty map when a job
      * carries none — so a missing key is a truncated envelope.
-     * QueueContract::coerceStoredMetadata() reads an absent value as that
+     * QueueContract::storedMetadata() reads an absent value as that
      * same empty map, on behalf of the backends that write the field only
      * when a caller supplied metadata, so without a presence check of its
      * own the decoder would accept the truncated envelope as a job.
@@ -435,8 +429,8 @@ final class RedisQueueTest extends TestCase
     /**
      * The real mechanism every push()/pop() ultimately relies on: a
      * JobSerializer::serialize()-normalized payload — a float, a nested
-     * list of maps, a BackedEnum tag — survives encode() (real
-     * json_encode with JSON_PRESERVE_ZERO_FRACTION) followed by
+     * list of maps, an enum case's backing value — survives encode()
+     * (real json_encode with JSON_PRESERVE_ZERO_FRACTION) followed by
      * decodeQueuedJob() (real json_decode) with every value's exact type
      * intact, the float included. Both are private, invoked via
      * reflection — PHPUnit's `?ReflectionMethod::invoke()`-based calls
@@ -476,12 +470,39 @@ final class RedisQueueTest extends TestCase
     }
 
     /**
+     * pop()'s blocking wait can use up the whole deadline on its own —
+     * BRPOPLPUSH counts whole seconds, so the shortest wait available is
+     * already a full one. Once it comes back empty the deadline is
+     * rechecked before anything else, so an expired pop() reserves
+     * nothing: the recorded commands are the four the one priority sweep
+     * issues, then the wait, and nothing after it.
+     *
+     * The scripted BRPOPLPUSH takes longer than the deadline it is given
+     * for exactly that reason.
+     */
+    public function test_pop_reserves_nothing_once_the_blocking_wait_has_consumed_the_deadline(): void
+    {
+        [$queue, $link] = self::scriptedQueue(
+            ['evalsha' => null, 'brpoplpush' => null],
+            ['brpoplpush' => 1_100_000],
+        );
+
+        self::assertNull($queue->pop(timeoutSeconds: 1, queues: ['high', 'default']));
+
+        self::assertSame(
+            ['evalsha', 'evalsha', 'evalsha', 'evalsha', 'brpoplpush'],
+            array_column($link->commands, 0),
+        );
+    }
+
+    /**
      * @param array<string, int|string|list<mixed>|null> $replies
+     * @param array<string, int> $durations microseconds per command
      * @return array{RedisQueue, ScriptedRedisLink}
      */
-    private static function scriptedQueue(array $replies): array
+    private static function scriptedQueue(array $replies, array $durations = []): array
     {
-        $link = new ScriptedRedisLink($replies);
+        $link = new ScriptedRedisLink($replies, $durations);
 
         return [new RedisQueue(new RedisClient($link)), $link];
     }
@@ -598,7 +619,7 @@ final class RedisQueueTest extends TestCase
         try {
             $queue->clear('has spaces');
             self::fail('Expected the malformed queue name to be rejected.');
-        } catch (InvalidQueueNameException) {
+        } catch (InvalidQueueArgumentException) {
             self::assertSame([], $link->commands);
         }
     }
@@ -613,7 +634,7 @@ final class RedisQueueTest extends TestCase
         // backend that stopped declaring ClearableQueueInterface fails
         // here as a TypeError instead of passing quietly. The queue-name
         // check still throws before Redis is touched.
-        $this->expectException(InvalidQueueNameException::class);
+        $this->expectException(InvalidQueueArgumentException::class);
         self::clearThrough($queue, '');
     }
 
