@@ -61,16 +61,15 @@ check('DELAYED_PROMOTION_BATCH_SIZE is a real, positive bound', is_int($batchSiz
 
 $delayedKey = 'kinetis_queue:bounded-promotion:delayed';
 $pendingKey = 'kinetis_queue:bounded-promotion:pending';
-$processingKey = 'kinetis_queue:bounded-promotion:processing';
+$leasedKey = 'kinetis_queue:bounded-promotion:leased';
 
-$redis->delete($delayedKey, $pendingKey, $processingKey);
+$redis->delete($delayedKey, $pendingKey, $leasedKey);
 
 $total = $batchSize + 50;
 
 for ($i = 0; $i < $total; $i++) {
-    // Pushed with a real delay, then re-scored to "already due" — the
-    // same pattern redis_atomic_transitions.php uses, avoiding an actual
-    // wait for the delay to elapse.
+    // Pushed with a real delay, then re-scored to "already due", which
+    // avoids an actual wait for the delay to elapse.
     $queue->push(new BoundedPromotionJob($i), delaySeconds: 60, queue: 'bounded-promotion');
 }
 
@@ -82,7 +81,7 @@ foreach ($members as $member) {
 }
 
 // One pop() call triggers exactly one promotion pass for this queue,
-// then pops one job into processing.
+// then reserves one job.
 $job = $queue->pop(timeoutSeconds: 5, queues: ['bounded-promotion']);
 check('pop() returned a job', $job !== null);
 
@@ -93,13 +92,13 @@ check(
     $remainingDelayed === $expectedRemaining,
 );
 
-// One promoted member became the job pop() returned (now in processing);
-// the rest of that same batch is sitting in pending, waiting.
+// One promoted member became the job pop() returned (now leased); the
+// rest of that same batch is sitting in pending, waiting.
 $pendingCount = $redis->getList($pendingKey)->getSize();
-$processingCount = $redis->getList($processingKey)->getSize();
+$leasedCount = $redis->getSortedSet($leasedKey)->getSize();
 check(
-    'the whole first batch is accounted for across pending + processing, none of it lost',
-    $pendingCount + $processingCount === $batchSize,
+    'the whole first batch is accounted for across pending + leased, none of it lost',
+    $pendingCount + $leasedCount === $batchSize,
 );
 
 // pop()'s own outer loop calls promoteDelayedJobs() again on its next

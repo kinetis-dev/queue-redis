@@ -1,6 +1,6 @@
 {
     "name": "kinetis/queue-redis",
-    "description": "A Redis-backed queue implementation for kinetis/queue's QueueInterface — the reliable-queue pattern (pending/processing/delayed lists), so a worker crash never silently loses a job.",
+    "description": "A Redis-backed queue implementation for kinetis/queue's QueueInterface — finite leases over pending/leased/delayed keys, so a crashed worker's job is redelivered rather than stranded.",
     "type": "library",
     "license": "MIT",
     "authors": [

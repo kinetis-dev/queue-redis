@@ -3,11 +3,12 @@
 declare(strict_types=1);
 
 /**
- * Real-backend regression coverage for RedisQueue — it has no committed
- * PHPUnit test, by design: a mocked "was this method called with X" test
- * can't prove backend-specific correctness (the reliable-queue
- * ack/release mechanics, priority-queue cycling). This runs the same
- * checks originally verified by hand, on every CI push instead of once.
+ * Real-backend coverage for RedisQueue's ordinary delivery cycle: push,
+ * reserve, settle, priority order, and malformed-message settlement.
+ * Only a real server proves these — the unit suite scripts the wire, but
+ * whether Redis actually removed the member a settlement named is a
+ * question the server has to answer. Lease expiry and crash recovery
+ * live in redis_lease_recovery.php.
  */
 
 require __DIR__ . '/../vendor/autoload.php';
@@ -86,10 +87,8 @@ function runQueueChecks(string $backend, QueueInterface $queue): void
 
 /**
  * An empty higher-priority queue must never delay finding a job already
- * waiting in a lower-priority one. pop()'s immediate, non-blocking sweep
- * — backed by reserveImmediately()'s atomic Lua RPOP+LPUSH, never
- * amphp/redis's non-nullable popTailPushHead() wrapper — is what gives
- * that, and it is timed here against a real Redis across three empty
+ * waiting in a lower-priority one: pop() sweeps every named queue before
+ * it waits at all. Timed here against a real Redis across three empty
  * higher-priority queues rather than asserted from the algorithm alone.
  */
 function runPrioritySweepTimingCheck(QueueInterface $queue): void
@@ -116,19 +115,14 @@ function runPrioritySweepTimingCheck(QueueInterface $queue): void
 }
 
 /**
- * KINETIS-63: a message that's already been reserved (moved from pending
- * to processing) but turns out to be malformed once decoded must not
- * strand the poison payload in processing forever, or crash the worker.
- * Written directly onto the pending list with a real, raw RPUSH — not
- * through push(), which would never accept malformed data in the first
- * place — the same "bypass the public API to simulate a corrupted
- * payload" technique a real hand-edited Redis value or non-Kinetis
- * publisher would produce. Verified against the real backend, not
- * mocked: settleIfMalformed()'s own coordination logic is already unit
- * tested (see QueueContractTest), but only a real Redis round trip can
- * prove the exact-payload LREM this backend's settle callback issues
- * genuinely finds and removes the entry, leaving the processing list
- * truly empty rather than merely appearing to under a fake.
+ * A message that has already been reserved but turns out to be malformed
+ * once decoded must not strand the poison payload under its lease, or
+ * crash the worker. Written directly onto the pending list with a real,
+ * raw push — not through push(), which would never accept malformed data
+ * — the same corruption a hand-edited Redis value or a non-Kinetis
+ * publisher would produce. Only a real Redis round trip proves the
+ * exact-member removal this backend's settle callback issues genuinely
+ * empties the leased set rather than merely appearing to under a fake.
  *
  * Every case below is a complete, current envelope with exactly one
  * field corrupted, so what it proves is that field's own rule and not
@@ -146,7 +140,7 @@ function runMalformedMessageChecks(RedisClient $redis, RedisQueue $queue): void
 
     $queueName = 'malformed-test';
     $pendingKey = "kinetis_queue:{$queueName}:pending";
-    $processingKey = "kinetis_queue:{$queueName}:processing";
+    $leasedKey = "kinetis_queue:{$queueName}:leased";
 
     $envelope = static function (array $overrides = [], array $missing = []): string {
         $envelope = [
@@ -188,7 +182,7 @@ function runMalformedMessageChecks(RedisClient $redis, RedisQueue $queue): void
 
         check("RedisQueue: pop() throws MalformedJobSettledException for a reserved message with {$label}", $threw !== null);
         check("RedisQueue: the settled exception names the right queue for {$label}", $threw?->queue === $queueName);
-        check("RedisQueue: nothing left in processing after {$label} — the poison payload was removed, not stranded", $redis->getList($processingKey)->getSize() === 0);
+        check("RedisQueue: nothing left leased after {$label} — the poison payload was removed, not stranded", $redis->getSortedSet($leasedKey)->getSize() === 0);
         check("RedisQueue: nothing left in pending either after {$label}", $redis->getList($pendingKey)->getSize() === 0);
     }
 

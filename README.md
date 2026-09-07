@@ -24,10 +24,11 @@ API-first applications, developed in the
 
 Adds Redis as a queue backend. `push()`/`pop()`/`ack()`/`release()`/`fail()`
 work exactly like any other backend — only your configuration changes. A
-worker crash never silently loses a job: `pop()` atomically moves a job
-from a `pending` list to a separate `processing` list rather than
-deleting it, so a job whose worker never called `ack()`/`release()`/
-`fail()` is stranded, not lost.
+reservation is a finite lease: `pop()` moves a job from the queue's
+`pending` list into a `leased` sorted set scored with an expiry, and any
+worker's next `pop()` returns a lease past its expiry to `pending` with
+`attempts` incremented. A job whose worker died mid-execution is
+redelivered rather than stranded.
 
 ```php
 use Kinetis\Config\Config;
@@ -40,35 +41,44 @@ $queue->push(new SendWelcomeEmail($email, $name), queue: 'default');
 
 `RedisQueue` declares `Kinetis\Queue\ClearableQueueInterface`.
 Clearing counts and removes the queue's pending and delayed entries in
-one Lua script, so the number it reports is what it removed; the
-processing list is untouched.
+one Lua script, so the number it reports is what it removed; live leases
+are untouched, since they are work a running worker still owns.
+`size()` counts pending, delayed and expired leases, not live ones.
 
-All three settlements are fenced against a delivery that is already
-over. `release()`'s Lua script performs its replacement only when the
-`LREM` found the source entry, and `ack()`/`fail()` read the same count
-back, so a duplicate, retried or reclaimed settlement raises
-`Kinetis\Queue\Exception\StaleJobHandleException` rather than
-reporting a removal that never happened.
+The leased member is the exact envelope string handed back as the job's
+handle, and reclaiming rewrites it with the incremented attempt count.
+That makes the handle a fence: `ack()`, `release()` and `fail()` act only
+on that exact member, so a settlement for a delivery that has been
+reclaimed or already settled raises
+`Kinetis\Queue\Exception\StaleJobHandleException` and writes nothing.
 
-A worker that dies mid-job leaves its payload in the processing list.
-Nothing returns it to `pending` — there is no reaper — so the job is
-stranded rather than redelivered.
+Recovery is not renewal. A job still running when its lease expires can
+execute alongside its replacement, so set
+`QUEUE_VISIBILITY_TIMEOUT_SECONDS` above normal job duration and keep
+handlers idempotent. `maxAttempts` bounds handlers that throw; it cannot
+bound a succession of processes that each die mid-execution.
+
+There is no reaper process. Every `pop()` promotes due delayed jobs and
+reclaims expired leases for each queue it is given, in priority order,
+before it waits.
 
 ## Configuration
 
 ```
 QUEUE_CONNECTION=redis
 REDIS_HOST=127.0.0.1
+QUEUE_VISIBILITY_TIMEOUT_SECONDS=300
 ```
 
-This package introduces no configuration keys of its own — `REDIS_HOST`/
-`REDIS_URL`/`REDIS_TLS`/... are the exact ones [`kinetis/cache-redis`](https://github.com/kinetis-dev/cache-redis)'s
+`QUEUE_VISIBILITY_TIMEOUT_SECONDS` is how long a reservation is leased
+before any worker may reclaim it. It defaults to 300 and must be a
+positive integer. Every other key this backend reads — `REDIS_HOST`/
+`REDIS_URL`/`REDIS_TLS`/... — is the exact one [`kinetis/cache-redis`](https://github.com/kinetis-dev/cache-redis)'s
 `RedisSimpleCache` already reads, scoped by `QUEUE_CONNECTION_NAME` the
 same way every other backend is. `REDIS_CLUSTER` is not among them: this
 backend is single-node, and it opens its own connection over
 [`kinetis/redis`](https://github.com/kinetis-dev/redis) rather than
-sharing the cache's, since a blocking `BRPOPLPUSH` would stall every
-pipelined command on a shared socket. [`kinetis/queue`](https://github.com/kinetis-dev/queue)'s own keys
+sharing the cache's, so its connection lifetime is its own. [`kinetis/queue`](https://github.com/kinetis-dev/queue)'s own keys
 (`QUEUE_CONNECTION`, `QUEUE_MAX_ATTEMPTS`, ...) are documented in that
 package; full reference:
 [kinetis.dev/docs/config.html](https://kinetis.dev/docs/config.html).

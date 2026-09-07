@@ -6,6 +6,7 @@ namespace Kinetis\QueueRedis;
 
 use Kinetis\Instrumentation\Telemetry;
 use Amp\Redis\RedisClient;
+use InvalidArgumentException;
 use Kinetis\Queue\ClearableQueueInterface;
 use Kinetis\Queue\Exception\MalformedQueuedJobDataException;
 use Kinetis\Queue\Exception\StaleJobHandleException;
@@ -15,64 +16,56 @@ use Kinetis\Queue\JobSettlement;
 use Kinetis\Queue\QueueContract;
 use Kinetis\Queue\QueuedJob;
 use Throwable;
+use function Amp\delay;
 
 /**
- * A naive Redis list pop removes the item at pop time — a worker that
- * crashes mid-job loses it with no way to detect or retry. This uses the
- * reliable-queue pattern instead: pop() atomically moves a payload from a
- * queue's pending list to a separate processing list, ack() removes it
- * from there, release() moves it back. That gives the same at-least-once
- * guarantee SqlQueue's `reserved_at` column gives.
+ * Each queue is three Redis keys: a `:pending` list, a `:delayed` sorted
+ * set scored by ready-at time, and a `:leased` sorted set scored by lease
+ * expiry. Named queues are separate Redis structures, not one structure
+ * with a filter on top.
  *
- * Every key is scoped by queue name (`kinetis_queue:{queue}:pending`,
- * `:processing`, `:delayed`) — named queues are genuinely separate Redis
- * structures, not one shared structure with a filter on top.
+ * A reservation is a finite lease. pop() moves the pending tail into the
+ * leased set with an expiry of `now + $visibilityTimeoutSeconds`, where
+ * `now` is Redis's own `TIME`: every worker then reads one lease clock
+ * regardless of its host's. A lease that passes its expiry is reclaimed
+ * by any worker's next pop(), which is what makes a job whose worker died
+ * mid-execution available again.
  *
- * pop() sweeps every queue in priority order with a non-blocking reserve
- * first, then suspends on the highest-priority queue for one second
- * before sweeping again — see QueueInterface for the contract this
- * meets. The immediate sweep cannot use amphp/redis's popTailPushHead()
- * (RPOPLPUSH): its declared return type is non-nullable `string` and
- * Redis answers nil on an empty list, which throws a TypeError inside
- * amphp/redis. reserveImmediately() runs the equivalent RPOP+LPUSH as
- * one Lua script instead. reserveBlocking() uses the correctly-nullable
- * popTailPushHeadBlocking() and is never called with 0, which BRPOPLPUSH
- * reads as "block forever".
+ * The lease is not renewed. A job still running when its lease expires
+ * can execute concurrently with its replacement, so
+ * `QUEUE_VISIBILITY_TIMEOUT_SECONDS` must be sized above normal job
+ * duration and handlers must be idempotent.
  *
- * Deliberately not built: a reaper for jobs stuck in a processing list
- * because the worker that popped them died before settling. That needs a
- * visibility-timeout mechanism this backend does not have. Such a job is
- * stranded, not lost — it is still in the processing list, exactly where
- * a reaper would find it.
+ * The member stored in the leased set is the exact envelope string handed
+ * back on QueuedJob::$handle, and that string is the delivery's fence.
+ * Every envelope carries a random `id`, and reclaiming increments
+ * `attempts`, so a reclaimed job's replacement envelope is a different
+ * string: an earlier worker's ack(), release() or fail() finds no member
+ * and raises Exception\StaleJobHandleException rather than settling the
+ * delivery somebody else now holds.
  *
- * release() and promoteDelayedJobs() each run as a single Lua script.
- * Redis executes one as an indivisible unit, so a crash can never leave
- * a job removed from the source with nothing written to the destination,
- * and a concurrent worker cannot observe a partially applied script.
+ * Every state change is one Lua script, which Redis executes as an
+ * indivisible unit:
  *
- * Indivisible is not the same as conditional, and release() needs both:
- * its script performs the LPUSH only when the LREM actually removed the
- * source entry, so a duplicate release() — a stale QueuedJob, a retry
- * after a connection drop with an unknown server-side outcome — raises
- * Exception\StaleJobHandleException instead of writing a second copy onto
- * pending. promoteDelayedJobs() needs no such guard: it has no
- * caller-supplied handle to go stale.
+ * - reserve() reads the pending tail, adds that exact member to the
+ *   leased set, and only then removes it from pending. A wrong-typed or
+ *   otherwise failing leased key aborts the script before the sole
+ *   pending copy is gone.
+ * - release() and lease reclaim both check that the exact member is still
+ *   leased, write the incremented-attempt replacement onto pending, and
+ *   then remove the old member. Two sweepers racing each other, or a
+ *   sweep racing a settlement, therefore produce one winner: the loser's
+ *   check fails and it writes nothing.
+ * - ack() and fail() remove only the exact member, and read the removal
+ *   count back so a delivery that is already over is reported rather than
+ *   silently accepted.
  *
- * All three settlements are fenced the same way. LREM reports how many
- * entries it removed, so a zero means this delivery is over and the
- * settlement raises StaleJobHandleException rather than reporting a
- * removal that never happened. The malformed-message path settles
- * through the same LREM without reading the count back: that message was
- * reserved moments earlier by this very call, so there is no stale
- * delivery to report.
- *
- * Every envelope carries a random `id`. Two pushes of byte-identical job
- * data would otherwise produce the same JSON string, and a sorted set's
- * members are unique, so a delayed duplicate would collapse onto the
- * first. release() preserves the `id`/`pushedAt` it reads off the
- * envelope it replaces: uniqueness only has to hold between independent
- * pushes, and regenerating either would erase the job's logical identity
- * and original enqueue time.
+ * pop() sweeps each named queue in priority order — promote due delayed
+ * jobs, reclaim expired leases, then reserve — and paces itself with
+ * Amp\delay() bounded by the caller's own deadline. There is no blocking
+ * Redis command and no reaper process: a blocking list move cannot
+ * install a sorted-set lease in the same atomic step, and the sweep every
+ * pop() already performs is the recovery path.
  *
  * Redis has no per-job columns, so bookkeeping travels inside the JSON
  * payload: the envelope is exactly {id, pushedAt, class, args, attempts,
@@ -80,19 +73,19 @@ use Throwable;
  * included, whose absence means a truncated envelope rather than "none
  * was stored". decodeQueuedJob() validates each against the shape
  * encode() writes before a QueuedJob exists; anything else settles
- * through QueueContract::settleIfMalformed(). The stored `attempts` is
- * the number of *completed* attempts (0 at push time); QueuedJob::$attempts
- * is that value plus one.
+ * through QueueContract::settleIfMalformed(), on the reserve path and on
+ * the reclaim path alike, so abandoned corruption is removed rather than
+ * swept forever. The stored `attempts` is the number of *completed*
+ * attempts (0 at push time); QueuedJob::$attempts is that value plus one.
  */
 final readonly class RedisQueue implements ClearableQueueInterface
 {
     /**
-     * How long pop() suspends on the highest-priority queue when nothing
-     * is waiting anywhere. Redis's blocking primitives take whole
-     * seconds only, and 0 means "block forever", so one second is the
-     * shortest wait available.
+     * The longest pop() waits between sweeps. Every wait is also bounded
+     * by what is left of the caller's deadline, so a short pop() does not
+     * overshoot.
      */
-    private const int BLOCK_SECONDS = 1;
+    private const float POLL_INTERVAL_SECONDS = 1.0;
 
     /**
      * A ceiling on how many delayed jobs promoteDelayedJobs() moves in one
@@ -110,6 +103,14 @@ final readonly class RedisQueue implements ClearableQueueInterface
     private const int DELAYED_PROMOTION_BATCH_SIZE = 100;
 
     /**
+     * The same ceiling for expired leases, for the same reason: each
+     * reclaim is its own round trip, and an unbounded sweep would delay
+     * the reservation pop() is there to make. The remainder is still
+     * expired on the next sweep.
+     */
+    private const int LEASE_RECLAIM_BATCH_SIZE = 100;
+
+    /**
      * The exact shape push() writes for `id`: bin2hex(random_bytes(16)),
      * which is 32 hexadecimal characters, lowercase because that is the
      * only case bin2hex() emits. envelopeIdentity() matches against this
@@ -122,9 +123,55 @@ final readonly class RedisQueue implements ClearableQueueInterface
      */
     private const string ID_PATTERN = '/^[0-9a-f]{32}\z/';
 
+    /**
+     * Reads the pending tail, leases that exact member until Redis's own
+     * clock passes `TIME + ARGV[1]`, and removes it from pending last, so
+     * a failing leased key cannot destroy the only copy. LREM's negative
+     * count removes the tail occurrence, the one this script read.
+     */
+    private const string RESERVE_SCRIPT = <<<'LUA'
+        local member = redis.call('LINDEX', KEYS[1], -1)
+        if not member then
+            return false
+        end
+        local now = redis.call('TIME')[1]
+        redis.call('ZADD', KEYS[2], now + tonumber(ARGV[1]), member)
+        redis.call('LREM', KEYS[1], -1, member)
+        return member
+        LUA;
+
+    /**
+     * The conditional replacement release() and lease reclaim share: the
+     * old member must still be leased, the replacement is written before
+     * the old member is removed, and the return value says which caller
+     * won.
+     */
+    private const string REQUEUE_SCRIPT = <<<'LUA'
+        if redis.call('ZSCORE', KEYS[1], ARGV[1]) == false then
+            return 0
+        end
+        redis.call('LPUSH', KEYS[2], ARGV[2])
+        redis.call('ZREM', KEYS[1], ARGV[1])
+        return 1
+        LUA;
+
+    /**
+     * @param int $visibilityTimeoutSeconds how long a reservation is
+     *     leased before any worker may reclaim it
+     */
     public function __construct(
         private RedisClient $redis,
-    ) {}
+        private int $visibilityTimeoutSeconds = 300,
+    ) {
+        // A timeout below one second would make a reservation reclaimable
+        // within the same second it was made, letting a second worker take
+        // over work that has barely started.
+        if ($visibilityTimeoutSeconds < 1) {
+            throw new InvalidArgumentException(
+                "RedisQueue needs a visibilityTimeoutSeconds of at least 1, got {$visibilityTimeoutSeconds}.",
+            );
+        }
+    }
 
     #[\Override]
     public function push(Job $job, int $delaySeconds = 0, string $queue = 'default', ?int $maxAttempts = null): void
@@ -172,60 +219,50 @@ final readonly class RedisQueue implements ClearableQueueInterface
         while (true) {
             foreach ($queues as $queue) {
                 $this->promoteDelayedJobs($queue);
+                $this->reclaimExpiredLeases($queue);
 
-                $job = $this->reserveImmediately($queue);
+                $job = $this->reserve($queue);
 
                 if ($job !== null) {
                     return $job;
                 }
             }
 
-            if ($deadline !== null && microtime(true) >= $deadline) {
+            if ($deadline === null) {
+                delay(self::POLL_INTERVAL_SECONDS);
+
+                continue;
+            }
+
+            // Bounded by what is left of the deadline, so pop() neither
+            // overshoots nor reserves a job after it: a wait that reaches
+            // the deadline ends the call instead of sweeping again for a
+            // caller who has stopped waiting.
+            $remaining = $deadline - microtime(true);
+
+            if ($remaining <= 0.0) {
                 return null;
             }
 
-            // Nothing waiting anywhere, so suspend on the highest-priority
-            // queue rather than spinning. Delayed promotion and the
-            // lower-priority queues are re-checked on the next sweep.
-            // BRPOPLPUSH counts whole seconds and reads 0 as "block
-            // forever", so the wait is a fixed one second rather than
-            // what is left of the deadline.
-            $job = $this->reserveBlocking($queues[0], self::BLOCK_SECONDS);
+            delay(min(self::POLL_INTERVAL_SECONDS, $remaining));
 
-            if ($job !== null) {
-                return $job;
-            }
-
-            // That wait can consume the rest of the deadline on its own.
-            // Rechecking here, rather than only at the top of the next
-            // sweep, keeps an expired deadline from reserving a job the
-            // caller has already stopped waiting for — a reservation
-            // nothing would settle until it was reclaimed.
-            if ($deadline !== null && microtime(true) >= $deadline) {
+            if (microtime(true) >= $deadline) {
                 return null;
             }
         }
     }
 
     /**
-     * An atomic RPOP+LPUSH pair as one Lua script — the same reliable
-     * pending-to-processing move, without amphp/redis's non-nullable
-     * popTailPushHead() wrapper. A Lua `false` from an empty list comes
-     * back as a RESP null bulk reply, and eval() is typed `mixed`, so
-     * there is no coercion to trip over.
+     * A Lua `false` for an empty pending list comes back as a RESP null
+     * bulk reply, and eval() is typed `mixed`, so there is no coercion to
+     * trip over.
      */
-    private function reserveImmediately(string $queue): ?QueuedJob
+    private function reserve(string $queue): ?QueuedJob
     {
         $payload = $this->redis->eval(
-            <<<'LUA'
-            local payload = redis.call('RPOP', KEYS[1])
-            if payload then
-                redis.call('LPUSH', KEYS[2], payload)
-            end
-            return payload
-            LUA,
-            [self::pendingKey($queue), self::processingKey($queue)],
-            [],
+            self::RESERVE_SCRIPT,
+            [self::pendingKey($queue), self::leasedKey($queue)],
+            [(string) $this->visibilityTimeoutSeconds],
         );
 
         if ($payload === null) {
@@ -237,30 +274,7 @@ final readonly class RedisQueue implements ClearableQueueInterface
             $queue,
             fn (): QueuedJob => $this->decodeQueuedJob($queue, $payload),
             function () use ($queue, $payload): void {
-                $this->removeFromProcessing($queue, $payload);
-            },
-        );
-    }
-
-    /**
-     * A genuine BRPOPLPUSH, suspending the calling Fiber through Revolt
-     * for up to $waitSeconds. Never called with 0, which Redis reads as
-     * "block forever".
-     */
-    private function reserveBlocking(string $queue, int $waitSeconds): ?QueuedJob
-    {
-        $payload = $this->redis->getList(self::pendingKey($queue))
-            ->popTailPushHeadBlocking(self::processingKey($queue), $waitSeconds);
-
-        if ($payload === null) {
-            return null;
-        }
-
-        return QueueContract::settleIfMalformed(
-            $queue,
-            fn (): QueuedJob => $this->decodeQueuedJob($queue, $payload),
-            function () use ($queue, $payload): void {
-                $this->removeFromProcessing($queue, $payload);
+                $this->removeLease($queue, $payload);
             },
         );
     }
@@ -276,7 +290,7 @@ final readonly class RedisQueue implements ClearableQueueInterface
      * indistinguishable from a truncated envelope through a `?? null`
      * read alone. Every failure here is caught by the caller through
      * QueueContract::settleIfMalformed(), so a malformed payload settles
-     * the already-reserved message instead of crashing the worker.
+     * the message it was read from instead of crashing the worker.
      */
     private function decodeQueuedJob(string $queue, string $payload): QueuedJob
     {
@@ -312,59 +326,21 @@ final readonly class RedisQueue implements ClearableQueueInterface
         $this->settle(JobSettlement::Ack, $job->queue, $payload);
     }
 
+    /**
+     * Replaces this delivery's leased member with an envelope carrying
+     * the attempt it just consumed. The replacement is written only if
+     * that exact member is still leased, so a duplicate release() — a
+     * stale handle, or a retry after a connection drop whose server-side
+     * outcome is unknown — raises Exception\StaleJobHandleException
+     * instead of enqueueing a second copy.
+     */
     #[\Override]
     public function release(QueuedJob $job): void
     {
         /** @var string $oldPayload */
         $oldPayload = $job->handle;
 
-        // id/pushedAt are carried over from the envelope being replaced,
-        // not regenerated — a fresh id only needs to be unique *between
-        // independent pushes* (see encode()'s own docblock, and this
-        // class's own docblock for why the delayed sorted set needs
-        // that). Regenerating either here would erase the job's logical
-        // identity and original enqueue time across every retry instead.
-        //
-        // Both are required fields, read through the same
-        // envelopeIdentity() check decodeQueuedJob() already applied to
-        // this exact payload before handing back the QueuedJob whose
-        // handle it is.
-        [$id, $pushedAt] = self::envelopeIdentity(
-            QueueContract::storedJsonArray($oldPayload, 'payload'),
-        );
-
-        $newPayload = self::encode(
-            ['class' => $job->class, 'args' => $job->args],
-            attempts: $job->attempts,
-            maxAttempts: $job->maxAttempts,
-            metadata: $job->metadata,
-            id: $id,
-            pushedAt: $pushedAt,
-        );
-
-        // One Lua script, not a remove() call followed by a separate
-        // pushHead() — see this class's own docblock for why the two-command
-        // version could lose the job outright on a crash between them.
-        // The destination write is gated on LREM actually having found and
-        // removed $oldPayload: without that check, this is indivisible
-        // but not a valid *conditional* transition — a duplicate
-        // release() call with the same handle, or a client retry after a
-        // connection drop whose server-side outcome is unknown, would
-        // otherwise LPUSH a second replacement even though the source
-        // entry the caller thinks it's releasing is already gone.
-        $removed = $this->redis->eval(
-            <<<'LUA'
-            local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
-            if removed == 1 then
-                redis.call('LPUSH', KEYS[2], ARGV[2])
-            end
-            return removed
-            LUA,
-            [self::processingKey($job->queue), self::pendingKey($job->queue)],
-            [$oldPayload, $newPayload],
-        );
-
-        if ($removed !== 1) {
+        if ($this->requeue($job->queue, $oldPayload, self::advancedEnvelope($job, $oldPayload)) !== 1) {
             throw StaleJobHandleException::forSettlement(JobSettlement::Release, $job->queue);
         }
     }
@@ -378,18 +354,29 @@ final readonly class RedisQueue implements ClearableQueueInterface
     }
 
     /**
-     * Pending plus delayed: a delayed job is waiting on this queue even
-     * while its own delay keeps it from being popped yet, so counting it
-     * is what makes "how much work is outstanding" match reality. The
-     * processing list is excluded — those belong to a worker already.
+     * Work a worker could pick up: pending, delayed — a delayed job is
+     * outstanding even while its own delay keeps it from being popped —
+     * and leases past their expiry, which the next pop() reclaims. Live
+     * leases belong to a worker already and are excluded. Counted in one
+     * script so the three reads share the server clock the expiry
+     * comparison needs.
      */
     #[\Override]
     public function size(string $queue = 'default'): int
     {
         QueueContract::assertValidQueueName($queue);
 
-        return $this->redis->getList(self::pendingKey($queue))->getSize()
-            + $this->redis->getSortedSet(self::delayedKey($queue))->getSize();
+        $size = $this->redis->eval(
+            <<<'LUA'
+            local now = redis.call('TIME')[1]
+            return redis.call('LLEN', KEYS[1])
+                + redis.call('ZCARD', KEYS[2])
+                + redis.call('ZCOUNT', KEYS[3], '-inf', now)
+            LUA,
+            [self::pendingKey($queue), self::delayedKey($queue), self::leasedKey($queue)],
+        );
+
+        return (int) $size;
     }
 
     /**
@@ -398,6 +385,11 @@ final readonly class RedisQueue implements ClearableQueueInterface
      * deleted without being counted, and DEL's own return value counts
      * keys, not the jobs inside them. The number returned is what this
      * call removed.
+     *
+     * The leased key is untouched. A lease is work a worker is running,
+     * and clear() has no handover to make: dropping it would leave that
+     * worker's settlement raising a stale-handle failure for a job
+     * nothing recorded.
      */
     #[\Override]
     public function clear(string $queue = 'default'): int
@@ -422,21 +414,106 @@ final readonly class RedisQueue implements ClearableQueueInterface
      */
     private function settle(JobSettlement $operation, string $queue, string $payload): void
     {
-        if ($this->removeFromProcessing($queue, $payload) !== 1) {
+        if ($this->removeLease($queue, $payload) !== 1) {
             throw StaleJobHandleException::forSettlement($operation, $queue);
         }
     }
 
     /**
      * Shared by settle() (a real QueuedJob's handle and queue) and the
-     * malformed-message path (the raw payload a decode failure was
-     * caught for, with no QueuedJob to read either off). The count is
-     * how many entries LREM removed: 1 for a live reservation, 0 for a
-     * delivery that is already over.
+     * malformed-message paths (the raw payload a decode failure was
+     * caught for, with no QueuedJob to read either off). The count is how
+     * many members ZREM removed: 1 for a live lease, 0 for a delivery
+     * that is already over.
      */
-    private function removeFromProcessing(string $queue, string $payload): int
+    private function removeLease(string $queue, string $payload): int
     {
-        return $this->redis->getList(self::processingKey($queue))->remove($payload, 1);
+        return $this->redis->getSortedSet(self::leasedKey($queue))->remove($payload);
+    }
+
+    /**
+     * Returns 1 when this caller performed the transition and 0 when the
+     * member was no longer leased — the fence release() reports on and
+     * reclaimExpiredLeases() reads to decide it lost a race.
+     */
+    private function requeue(string $queue, string $oldPayload, string $newPayload): int
+    {
+        return (int) $this->redis->eval(
+            self::REQUEUE_SCRIPT,
+            [self::leasedKey($queue), self::pendingKey($queue)],
+            [$oldPayload, $newPayload],
+        );
+    }
+
+    /**
+     * Moves every lease whose expiry has passed back onto pending with
+     * its attempt count advanced, in batches (see
+     * LEASE_RECLAIM_BATCH_SIZE). The expiry comparison uses Redis's own
+     * TIME, so a worker with a skewed host clock neither reclaims early
+     * nor holds a lease past its end.
+     *
+     * A member that no longer decodes is abandoned corruption: it settles
+     * through the same malformed boundary a reservation does, which
+     * removes it and raises Exception\MalformedJobSettledException, so it
+     * is neither requeued forever nor swept on every subsequent pop().
+     */
+    private function reclaimExpiredLeases(string $queue): void
+    {
+        $expired = $this->redis->eval(
+            <<<'LUA'
+            local now = redis.call('TIME')[1]
+            return redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, ARGV[1])
+            LUA,
+            [self::leasedKey($queue)],
+            [(string) self::LEASE_RECLAIM_BATCH_SIZE],
+        );
+
+        /** @var list<string> $expired */
+        $expired = \is_array($expired) ? $expired : [];
+
+        foreach ($expired as $payload) {
+            $replacement = QueueContract::settleIfMalformed(
+                $queue,
+                fn (): string => self::advancedEnvelope($this->decodeQueuedJob($queue, $payload), $payload),
+                function () use ($queue, $payload): void {
+                    $this->removeLease($queue, $payload);
+                },
+            );
+
+            // A zero means another sweeper reclaimed this member first, or
+            // its own worker settled it after the expiry was read. Either
+            // way that caller owns the outcome and this one writes nothing.
+            $this->requeue($queue, $payload, $replacement);
+        }
+    }
+
+    /**
+     * The envelope that replaces $oldPayload once its attempt is spent:
+     * the same job with QueuedJob::$attempts — the completed-attempt
+     * count including this delivery — persisted.
+     *
+     * id/pushedAt are carried over from the envelope being replaced, not
+     * regenerated. A fresh id only needs to be unique between independent
+     * pushes (see encode()'s own docblock); regenerating either here
+     * would erase the job's logical identity and original enqueue time
+     * across every retry. Both are required fields, read through the same
+     * envelopeIdentity() check decodeQueuedJob() already applied to this
+     * exact payload.
+     */
+    private static function advancedEnvelope(QueuedJob $job, string $oldPayload): string
+    {
+        [$id, $pushedAt] = self::envelopeIdentity(
+            QueueContract::storedJsonArray($oldPayload, 'payload'),
+        );
+
+        return self::encode(
+            ['class' => $job->class, 'args' => $job->args],
+            attempts: $job->attempts,
+            maxAttempts: $job->maxAttempts,
+            metadata: $job->metadata,
+            id: $id,
+            pushedAt: $pushedAt,
+        );
     }
 
     /**
@@ -444,10 +521,9 @@ final readonly class RedisQueue implements ClearableQueueInterface
      * pushedAt are always the caller's own, never invented here: push()
      * generates a fresh pair per *independent* push (which is what keeps
      * two envelopes with byte-identical job data from ever becoming the
-     * same string — see this class's own docblock for why that matters
-     * specifically for the delayed sorted set, whose members must be
-     * unique), and release() passes the pair it read off the envelope
-     * being replaced.
+     * same string — the delayed and leased sorted sets both need their
+     * members to be unique), and a retry passes the pair it read off the
+     * envelope being replaced.
      *
      * @param array{class: class-string, args: array<string, mixed>} $serialized
      * @param array<string, string> $metadata
@@ -471,13 +547,13 @@ final readonly class RedisQueue implements ClearableQueueInterface
     /**
      * The two identity fields every envelope carries, validated rather
      * than read optionally: `id` keeps two byte-identical jobs from
-     * collapsing into one member of the delayed sorted set, and
-     * `pushedAt` is the original enqueue time release() carries across
-     * every retry. Both are checked against the exact shape encode()
-     * writes — `id` is bin2hex(random_bytes(16)), `pushedAt` a positive
-     * Unix time json_decode() returned as a native integer — because
-     * accepting a wider shape here would mean release() carrying an
-     * identity the sorted set's uniqueness never rested on.
+     * collapsing into one member of a sorted set, and `pushedAt` is the
+     * original enqueue time every retry carries forward. Both are checked
+     * against the exact shape encode() writes — `id` is
+     * bin2hex(random_bytes(16)), `pushedAt` a positive Unix time
+     * json_decode() returned as a native integer — because accepting a
+     * wider shape here would mean carrying an identity the sorted set's
+     * uniqueness never rested on.
      *
      * @param array<array-key, mixed> $decoded
      * @return array{0: string, 1: int}
@@ -509,15 +585,13 @@ final readonly class RedisQueue implements ClearableQueueInterface
      * One Lua script does the read (ZRANGEBYSCORE, bounded by
      * DELAYED_PROMOTION_BATCH_SIZE — see that constant's own docblock)
      * and every move (ZREM+LPUSH per ready member) as a single indivisible
-     * unit — see this class's own docblock for why a read followed by
-     * separate remove-then-push commands per member would both
-     * double-process under concurrent workers and lose a job outright on
-     * a crash mid-loop. Redis executes one EVAL to completion before
-     * touching another command from any client, so two workers calling
-     * this concurrently are simply serialized by Redis itself: whichever
-     * one runs first moves its whole batch of ready members, and the
-     * second sees whatever's left (nothing, or the next batch) — no
-     * return-value check needed to tell which worker "won."
+     * unit, so two workers calling this concurrently are serialized by
+     * Redis itself: whichever runs first moves its whole batch of ready
+     * members, and the second sees whatever is left.
+     *
+     * The due-time comparison is this process's own clock, matching the
+     * score push() writes. Lease expiry is the one clock that must be
+     * shared across workers, and it reads Redis TIME for exactly that.
      */
     private function promoteDelayedJobs(string $queue): void
     {
@@ -539,9 +613,9 @@ final readonly class RedisQueue implements ClearableQueueInterface
         return "kinetis_queue:{$queue}:pending";
     }
 
-    private static function processingKey(string $queue): string
+    private static function leasedKey(string $queue): string
     {
-        return "kinetis_queue:{$queue}:processing";
+        return "kinetis_queue:{$queue}:leased";
     }
 
     private static function delayedKey(string $queue): string
