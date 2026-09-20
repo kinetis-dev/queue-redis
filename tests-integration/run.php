@@ -64,6 +64,18 @@ function runQueueChecks(string $backend, QueueInterface $queue): void
     check("{$backend}: released job comes back with attempts incremented", $second?->attempts === 2);
     $queue->ack($second);
 
+    // A delayed release is held by the backend's own durable primitive,
+    // which only a real server can prove: the job must be unpoppable
+    // while the delay runs and poppable once it has.
+    $queue->push(new IntegrationTestJob('back-off'), maxAttempts: 3);
+    $delayed = $queue->pop(timeoutSeconds: 5);
+    $queue->release($delayed, 3);
+    check("{$backend}: a delayed release is not poppable while the delay runs", $queue->pop(timeoutSeconds: 1) === null);
+    $retried = $queue->pop(timeoutSeconds: 15);
+    check("{$backend}: the delayed job comes back once its delay has run", $retried?->args['message'] === 'back-off');
+    check("{$backend}: the delayed retry still carries its incremented attempt", $retried?->attempts === 2);
+    $queue->ack($retried);
+
     // fail() removes the job permanently.
     $queue->push(new IntegrationTestJob('doomed'));
     $doomed = $queue->pop(timeoutSeconds: 5);

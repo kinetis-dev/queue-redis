@@ -640,10 +640,13 @@ final class RedisQueueTest extends TestCase
 
         $requeue = $link->commands[2];
         self::assertSame(
-            ['kinetis_queue:default:leased', 'kinetis_queue:default:pending'],
+            ['kinetis_queue:default:leased', 'kinetis_queue:default:pending', 'kinetis_queue:default:delayed'],
             self::scriptKeys($requeue),
         );
-        self::assertSame([$abandoned, $reclaimed], self::scriptArgs($requeue));
+        // "0" is the due time: a crashed delivery's reclaim is not a
+        // handled job failure and carries no retry delay, so the
+        // replacement goes straight onto pending.
+        self::assertSame([$abandoned, $reclaimed, '0'], self::scriptArgs($requeue));
     }
 
     /**
@@ -665,7 +668,7 @@ final class RedisQueueTest extends TestCase
             [
                 ['kinetis_queue:default:delayed', 'kinetis_queue:default:pending'],
                 ['kinetis_queue:default:leased'],
-                ['kinetis_queue:default:leased', 'kinetis_queue:default:pending'],
+                ['kinetis_queue:default:leased', 'kinetis_queue:default:pending', 'kinetis_queue:default:delayed'],
                 ['kinetis_queue:default:pending', 'kinetis_queue:default:leased'],
             ],
             array_map(self::scriptKeys(...), \array_slice($link->commands, 0, 4)),
@@ -711,17 +714,88 @@ final class RedisQueueTest extends TestCase
         $queue->release(self::delivery($held));
 
         self::assertSame(
-            ['kinetis_queue:default:leased', 'kinetis_queue:default:pending'],
+            ['kinetis_queue:default:leased', 'kinetis_queue:default:pending', 'kinetis_queue:default:delayed'],
             self::scriptKeys($link->commands[0]),
         );
 
-        [$old, $new] = self::scriptArgs($link->commands[0]);
+        [$old, $new, $dueAt] = self::scriptArgs($link->commands[0]);
         self::assertSame($held, $old);
+        self::assertSame('0', $dueAt, 'an undelayed release keeps the pending-list path');
 
         $replacement = json_decode((string) $new, true, flags: JSON_THROW_ON_ERROR);
         self::assertSame(1, $replacement['attempts']);
         self::assertSame(self::VALID_ID, $replacement['id']);
         self::assertSame(1_700_000_000, $replacement['pushedAt']);
+    }
+
+    /**
+     * A delayed retry carries a due time instead, scored the way a
+     * delayed push() scores its own member — this process's clock, the
+     * one promoteDelayedJobs() compares against — and reaches the script
+     * as its third argument alongside the delayed key.
+     */
+    public function test_a_delayed_release_carries_the_due_time_and_the_delayed_key(): void
+    {
+        $held = self::envelopeString(['attempts' => 0]);
+
+        [$queue, $link] = self::scriptedQueue(['evalsha' => 1]);
+
+        $before = time();
+        $queue->release(self::delivery($held), 45);
+        $after = time();
+
+        self::assertSame(
+            ['kinetis_queue:default:leased', 'kinetis_queue:default:pending', 'kinetis_queue:default:delayed'],
+            self::scriptKeys($link->commands[0]),
+        );
+
+        [, , $dueAt] = self::scriptArgs($link->commands[0]);
+
+        self::assertGreaterThanOrEqual($before + 45, (int) $dueAt);
+        self::assertLessThanOrEqual($after + 45, (int) $dueAt);
+    }
+
+    /**
+     * The delayed and immediate paths are two branches of one script, not
+     * two round trips: the fence, the choice of destination and the
+     * removal of the lease are all inside the unit Redis runs
+     * indivisibly, so no delayed retry can exist where the member is
+     * neither leased nor stored.
+     */
+    public function test_a_delayed_release_is_one_fenced_script_rather_than_a_second_round_trip(): void
+    {
+        [$queue, $link] = self::scriptedQueue(['evalsha' => 1]);
+
+        $queue->release(self::delivery(self::envelopeString(['attempts' => 0])), 45);
+
+        self::assertCount(1, $link->commands);
+        self::assertSame('evalsha', $link->commands[0][0]);
+
+        $script = new ReflectionClass(RedisQueue::class)->getConstant('REQUEUE_SCRIPT');
+
+        self::assertIsString($script);
+        self::assertStringContainsString("ZSCORE', KEYS[1], ARGV[1]", $script);
+        self::assertStringContainsString("ZADD', KEYS[3], dueAt, ARGV[2]", $script);
+        self::assertStringContainsString("LPUSH', KEYS[2], ARGV[2]", $script);
+
+        // The lease is removed last on either branch: the replacement is
+        // already written by the time the only copy stops being leased.
+        self::assertGreaterThan(
+            (int) strpos($script, 'LPUSH'),
+            (int) strpos($script, 'ZREM'),
+        );
+        self::assertGreaterThan(
+            (int) strpos($script, 'ZADD'),
+            (int) strpos($script, 'ZREM'),
+        );
+    }
+
+    public function test_release_rejects_a_negative_delay_before_ever_touching_redis(): void
+    {
+        $queue = $this->neverConnectedQueue();
+
+        $this->expectException(InvalidQueueArgumentException::class);
+        $queue->release(self::delivery(self::envelopeString()), -1);
     }
 
     /**

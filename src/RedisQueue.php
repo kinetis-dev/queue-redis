@@ -52,10 +52,11 @@ use function Amp\delay;
  *   otherwise failing leased key aborts the script before the sole
  *   pending copy is gone.
  * - release() and lease reclaim both check that the exact member is still
- *   leased, write the incremented-attempt replacement onto pending, and
- *   then remove the old member. Two sweepers racing each other, or a
- *   sweep racing a settlement, therefore produce one winner: the loser's
- *   check fails and it writes nothing.
+ *   leased, write the incremented-attempt replacement onto pending — or,
+ *   for a release() carrying a delay, into the delayed set with a due
+ *   score — and then remove the old member. Two sweepers racing each
+ *   other, or a sweep racing a settlement, therefore produce one winner:
+ *   the loser's check fails and it writes nothing.
  * - ack() and fail() remove only the exact member, and read the removal
  *   count back so a delivery that is already over is reported rather than
  *   silently accepted.
@@ -145,12 +146,24 @@ final readonly class RedisQueue implements ClearableQueueInterface
      * old member must still be leased, the replacement is written before
      * the old member is removed, and the return value says which caller
      * won.
+     *
+     * ARGV[3] is the replacement's due time, or 0 for "available now".
+     * Choosing between the delayed sorted set and the pending list
+     * happens inside the same script as the fence, so a delayed retry is
+     * one indivisible transition exactly as an immediate one is — there
+     * is no window where the member is neither leased nor stored. A real
+     * due score is a Unix time, so 0 can never collide with one.
      */
     private const string REQUEUE_SCRIPT = <<<'LUA'
         if redis.call('ZSCORE', KEYS[1], ARGV[1]) == false then
             return 0
         end
-        redis.call('LPUSH', KEYS[2], ARGV[2])
+        local dueAt = tonumber(ARGV[3])
+        if dueAt > 0 then
+            redis.call('ZADD', KEYS[3], dueAt, ARGV[2])
+        else
+            redis.call('LPUSH', KEYS[2], ARGV[2])
+        end
         redis.call('ZREM', KEYS[1], ARGV[1])
         return 1
         LUA;
@@ -333,14 +346,29 @@ final readonly class RedisQueue implements ClearableQueueInterface
      * stale handle, or a retry after a connection drop whose server-side
      * outcome is unknown — raises Exception\StaleJobHandleException
      * instead of enqueueing a second copy.
+     *
+     * $delaySeconds sends the replacement to the same `:delayed` sorted
+     * set a delayed push() writes to, scored `now + $delaySeconds` off
+     * this process's own clock — the clock promoteDelayedJobs() compares
+     * against — so a retry waits exactly the way a delayed enqueue does
+     * and needs no second mechanism. 0 keeps the pending-list path.
      */
     #[\Override]
-    public function release(QueuedJob $job): void
+    public function release(QueuedJob $job, int $delaySeconds = 0): void
     {
+        QueueContract::assertValidReleaseDelay($delaySeconds);
+
         /** @var string $oldPayload */
         $oldPayload = $job->handle;
 
-        if ($this->requeue($job->queue, $oldPayload, self::advancedEnvelope($job, $oldPayload)) !== 1) {
+        $settled = $this->requeue(
+            $job->queue,
+            $oldPayload,
+            self::advancedEnvelope($job, $oldPayload),
+            dueAt: $delaySeconds > 0 ? time() + $delaySeconds : 0,
+        );
+
+        if ($settled !== 1) {
             throw StaleJobHandleException::forSettlement(JobSettlement::Release, $job->queue);
         }
     }
@@ -435,13 +463,16 @@ final readonly class RedisQueue implements ClearableQueueInterface
      * Returns 1 when this caller performed the transition and 0 when the
      * member was no longer leased — the fence release() reports on and
      * reclaimExpiredLeases() reads to decide it lost a race.
+     *
+     * $dueAt is the Unix time the replacement becomes poppable, or 0 for
+     * straight onto pending.
      */
-    private function requeue(string $queue, string $oldPayload, string $newPayload): int
+    private function requeue(string $queue, string $oldPayload, string $newPayload, int $dueAt = 0): int
     {
         return (int) $this->redis->eval(
             self::REQUEUE_SCRIPT,
-            [self::leasedKey($queue), self::pendingKey($queue)],
-            [$oldPayload, $newPayload],
+            [self::leasedKey($queue), self::pendingKey($queue), self::delayedKey($queue)],
+            [$oldPayload, $newPayload, (string) $dueAt],
         );
     }
 
@@ -480,6 +511,10 @@ final readonly class RedisQueue implements ClearableQueueInterface
                 },
             );
 
+            // Reclaiming a crashed delivery is not a handled job failure,
+            // so it carries no retry delay: the work was never run to a
+            // conclusion and the next worker should pick it up at once.
+            //
             // A zero means another sweeper reclaimed this member first, or
             // its own worker settled it after the expiry was read. Either
             // way that caller owns the outcome and this one writes nothing.
