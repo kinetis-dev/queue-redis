@@ -8,7 +8,6 @@ use Amp\Redis\RedisClient;
 use Amp\Socket\ClientTlsContext;
 use InvalidArgumentException;
 use Kinetis\Config\Config;
-use Kinetis\Queue\ClearableQueueInterface;
 use Kinetis\Redis\Client;
 use Kinetis\Redis\ClientOptions;
 use Kinetis\Redis\ConnectionUri;
@@ -21,13 +20,20 @@ use Kinetis\Redis\Endpoint;
  * directly, the same pattern used for every other optional queue
  * backend (`kinetis/queue-sqs`, `kinetis/queue-rabbitmq`).
  *
- * Returns `ClearableQueueInterface`, the capability this backend
- * declares; see `QueueFactory` for why the connection-driven factory
- * stays on `QueueInterface`.
+ * Returns the concrete `RedisQueue`, which declares both the clearing
+ * and the disposal capability; see `QueueFactory` for why the
+ * connection-driven factory stays on `QueueInterface`.
  *
  * The queue builds its own physical connection from the `REDIS_*`
  * settings rather than sharing the cache's, so its operation budget and
- * connection lifetime are its own.
+ * connection lifetime are its own. That connection is the queue's to
+ * close: the `Kinetis\Redis\Client` opened here is kept and its
+ * close() handed over as the queue's disposer, since the
+ * `Amp\Redis\RedisClient` facade the queue runs commands through
+ * exposes none. A caller binding this result itself registers
+ * `$queue->dispose(...)` on the scope it binds into;
+ * `Kinetis\Queue\PackageBootstrap` does that for the queue
+ * `QUEUE_CONNECTION=redis` builds.
  */
 final class RedisQueueFactory
 {
@@ -39,7 +45,7 @@ final class RedisQueueFactory
      */
     private const int DEFAULT_VISIBILITY_TIMEOUT_SECONDS = 300;
 
-    public static function fromConfig(Config $config, string $connectionName = 'default'): ClearableQueueInterface
+    public static function fromConfig(Config $config, string $connectionName = 'default'): RedisQueue
     {
         $options = self::options($config, $connectionName);
         $visibilityTimeout = self::visibilityTimeoutSeconds($config, $connectionName);
@@ -52,7 +58,7 @@ final class RedisQueueFactory
                 $options->withPassword($parsed->password ?? $options->password)->withDatabase($parsed->database),
             );
 
-            return new RedisQueue(new RedisClient($client->link()), $visibilityTimeout);
+            return new RedisQueue(new RedisClient($client->link()), $visibilityTimeout, $client->close(...));
         }
 
         $host = $config->string(Config::scopedKey('REDIS_HOST', $connectionName), '');
@@ -66,7 +72,7 @@ final class RedisQueueFactory
             $options->withDatabase($config->int(Config::scopedKey('REDIS_DATABASE', $connectionName), 0)),
         );
 
-        return new RedisQueue(new RedisClient($client->link()), $visibilityTimeout);
+        return new RedisQueue(new RedisClient($client->link()), $visibilityTimeout, $client->close(...));
     }
 
     /**

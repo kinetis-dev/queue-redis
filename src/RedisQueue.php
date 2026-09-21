@@ -6,8 +6,10 @@ namespace Kinetis\QueueRedis;
 
 use Kinetis\Instrumentation\Telemetry;
 use Amp\Redis\RedisClient;
+use Closure;
 use InvalidArgumentException;
 use Kinetis\Queue\ClearableQueueInterface;
+use Kinetis\Queue\DisposableQueueInterface;
 use Kinetis\Queue\Exception\MalformedQueuedJobDataException;
 use Kinetis\Queue\Exception\StaleJobHandleException;
 use Kinetis\Queue\Job;
@@ -79,7 +81,7 @@ use function Amp\delay;
  * swept forever. The stored `attempts` is the number of *completed*
  * attempts (0 at push time); QueuedJob::$attempts is that value plus one.
  */
-final readonly class RedisQueue implements ClearableQueueInterface
+final class RedisQueue implements ClearableQueueInterface, DisposableQueueInterface
 {
     /**
      * The longest pop() waits between sweeps. Every wait is also bounded
@@ -169,12 +171,23 @@ final readonly class RedisQueue implements ClearableQueueInterface
         LUA;
 
     /**
+     * $redis is the caller's client and stays the caller's to close:
+     * $disposer is null here, so dispose() releases nothing. Amp's
+     * RedisClient exposes no close of its own, so a caller owning the
+     * transport underneath it passes the operation that closes that —
+     * `$client->close(...)` on the {@see \Kinetis\Redis\Client} the
+     * link came from, which is what
+     * {@see RedisQueueFactory::fromConfig()} does for the client it
+     * opens.
+     *
      * @param int $visibilityTimeoutSeconds how long a reservation is
      *     leased before any worker may reclaim it
+     * @param ?Closure(): void $disposer
      */
     public function __construct(
-        private RedisClient $redis,
-        private int $visibilityTimeoutSeconds = 300,
+        private readonly RedisClient $redis,
+        private readonly int $visibilityTimeoutSeconds = 300,
+        private ?Closure $disposer = null,
     ) {
         // A timeout below one second would make a reservation reclaimable
         // within the same second it was made, letting a second worker take
@@ -434,6 +447,19 @@ final readonly class RedisQueue implements ClearableQueueInterface
         );
 
         return (int) $removed;
+    }
+
+    /**
+     * Closes the client this queue owns, if it was given one to own. The
+     * disposer is dropped as it runs, so a second call releases nothing
+     * a second time.
+     */
+    #[\Override]
+    public function dispose(): void
+    {
+        $disposer = $this->disposer;
+        $this->disposer = null;
+        $disposer?->__invoke();
     }
 
     /**

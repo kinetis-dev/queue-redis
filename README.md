@@ -39,6 +39,15 @@ $queue = RedisQueueFactory::fromConfig($config);
 $queue->push(new SendWelcomeEmail($email, $name), queue: 'default');
 ```
 
+The factory opens the queue's own `Kinetis\Redis\Client` and hands the
+queue that client's `close()`, so `RedisQueue` declares
+`Kinetis\Queue\DisposableQueueInterface` and `dispose()` ends the
+connection when the worker does. Building one yourself means registering
+that — `$app->onDispose($queue->dispose(...))`; the bootstrap behind
+`QUEUE_CONNECTION=redis` already does. A `RedisQueue` constructed
+directly around an `Amp\Redis\RedisClient` you built closes nothing:
+that facade exposes no close, and the transport under it stays yours.
+
 `RedisQueue` declares `Kinetis\Queue\ClearableQueueInterface`.
 Clearing counts and removes the queue's pending and delayed entries in
 one Lua script, so the number it reports is what it removed; live leases
