@@ -17,6 +17,7 @@ use Kinetis\Queue\JobSerializer;
 use Kinetis\Queue\JobSettlement;
 use Kinetis\Queue\QueueContract;
 use Kinetis\Queue\QueuedJob;
+use Kinetis\Queue\RenewableQueueInterface;
 use Throwable;
 use function Amp\delay;
 
@@ -33,10 +34,14 @@ use function Amp\delay;
  * by any worker's next pop(), which is what makes a job whose worker died
  * mid-execution available again.
  *
- * The lease is not renewed. A job still running when its lease expires
- * can execute concurrently with its replacement, so
- * `QUEUE_VISIBILITY_TIMEOUT_SECONDS` must be sized above normal job
- * duration and handlers must be idempotent.
+ * The lease is renewed while its job runs: this queue declares
+ * Kinetis\Queue\RenewableQueueInterface, and QueueWorker pushes the
+ * expiry forward at half the window for as long as the handler is
+ * running. `QUEUE_VISIBILITY_TIMEOUT_SECONDS` therefore sizes how long a
+ * *crashed* worker's job waits to come back, not how long a job may
+ * take. Delivery is still at-least-once — a worker that dies stops
+ * renewing, and a handler that never yields to the event loop is never
+ * renewed — so handlers must still be idempotent.
  *
  * The member stored in the leased set is the exact envelope string handed
  * back on QueuedJob::$handle, and that string is the delivery's fence.
@@ -81,7 +86,7 @@ use function Amp\delay;
  * swept forever. The stored `attempts` is the number of *completed*
  * attempts (0 at push time); QueuedJob::$attempts is that value plus one.
  */
-final class RedisQueue implements ClearableQueueInterface, DisposableQueueInterface
+final class RedisQueue implements ClearableQueueInterface, DisposableQueueInterface, RenewableQueueInterface
 {
     /**
      * The longest pop() waits between sweeps. Every wait is also bounded
@@ -168,6 +173,22 @@ final class RedisQueue implements ClearableQueueInterface, DisposableQueueInterf
         end
         redis.call('ZREM', KEYS[1], ARGV[1])
         return 1
+        LUA;
+
+    /**
+     * Resets the exact leased member's expiry to Redis's own `TIME` plus
+     * the configured window. `XX` is the fence: it updates a member that
+     * is already in the leased set and never adds one, so a delivery
+     * that was settled or reclaimed in the meantime gets nothing back.
+     *
+     * The changed-member count is not read. `ZADD` reports
+     * 0 for a member whose score is unchanged, which is what a renewal
+     * landing in the same second as the previous one produces, so the
+     * count cannot tell a stale receipt from a timely repeat.
+     */
+    private const string RENEW_SCRIPT = <<<'LUA'
+        local now = redis.call('TIME')[1]
+        redis.call('ZADD', KEYS[1], 'XX', now + tonumber(ARGV[2]), ARGV[1])
         LUA;
 
     /**
@@ -392,6 +413,32 @@ final class RedisQueue implements ClearableQueueInterface, DisposableQueueInterf
         /** @var string $payload */
         $payload = $job->handle;
         $this->settle(JobSettlement::Fail, $job->queue, $payload);
+    }
+
+    #[\Override]
+    public function visibilityTimeoutSeconds(): int
+    {
+        return $this->visibilityTimeoutSeconds;
+    }
+
+    /**
+     * One RENEW_SCRIPT round trip against this delivery's own envelope.
+     * Nothing is returned and nothing is raised for a lapsed delivery —
+     * see Kinetis\Queue\RenewableQueueInterface for why the count is
+     * not a truthful fence here. A transport failure propagates like any
+     * other command's.
+     */
+    #[\Override]
+    public function renew(QueuedJob $job): void
+    {
+        /** @var string $payload */
+        $payload = $job->handle;
+
+        $this->redis->eval(
+            self::RENEW_SCRIPT,
+            [self::leasedKey($job->queue)],
+            [$payload, (string) $this->visibilityTimeoutSeconds],
+        );
     }
 
     /**

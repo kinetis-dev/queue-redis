@@ -14,6 +14,7 @@ use Kinetis\Queue\Exception\StaleJobHandleException;
 use Kinetis\Queue\JobSerializer;
 use Kinetis\Queue\JobSettlement;
 use Kinetis\Queue\QueuedJob;
+use Kinetis\Queue\RenewableQueueInterface;
 use Kinetis\QueueRedis\RedisQueue;
 use Kinetis\QueueRedis\Tests\Fixtures\Priority;
 use Kinetis\QueueRedis\Tests\Fixtures\RichPayloadJob;
@@ -476,11 +477,11 @@ final class RedisQueueTest extends TestCase
      *     pop() puts on the wire under the same `evalsha` name
      * @return array{RedisQueue, ScriptedRedisLink}
      */
-    private static function scriptedQueue(array $replies, array $sequences = []): array
+    private static function scriptedQueue(array $replies, array $sequences = [], int $visibilityTimeoutSeconds = 300): array
     {
         $link = new ScriptedRedisLink($replies, [], $sequences);
 
-        return [new RedisQueue(new RedisClient($link)), $link];
+        return [new RedisQueue(new RedisClient($link), $visibilityTimeoutSeconds), $link];
     }
 
     /**
@@ -964,5 +965,53 @@ final class RedisQueueTest extends TestCase
     private static function clearThrough(ClearableQueueInterface $queue, string $name): int
     {
         return $queue->clear($name);
+    }
+
+    public function test_the_configured_window_is_what_the_renewal_capability_reports(): void
+    {
+        [$queue] = self::scriptedQueue([], visibilityTimeoutSeconds: 90);
+
+        self::assertInstanceOf(RenewableQueueInterface::class, $queue);
+        self::assertSame(90, $queue->visibilityTimeoutSeconds());
+    }
+
+    /**
+     * One script, addressing the leased key alone and carrying the exact
+     * envelope plus the window to re-apply. `XX` is the fence: a member
+     * the leased set no longer holds is never added back by a renewal.
+     */
+    public function test_renewing_resets_the_exact_leased_member_to_the_configured_window(): void
+    {
+        $held = self::envelopeString(['attempts' => 0]);
+
+        [$queue, $link] = self::scriptedQueue(['evalsha' => 0], visibilityTimeoutSeconds: 90);
+
+        $queue->renew(self::delivery($held));
+
+        self::assertCount(1, $link->commands);
+        self::assertSame('evalsha', $link->commands[0][0]);
+        self::assertSame(['kinetis_queue:default:leased'], self::scriptKeys($link->commands[0]));
+        self::assertSame([$held, '90'], self::scriptArgs($link->commands[0]));
+
+        $script = new ReflectionClass(RedisQueue::class)->getConstant('RENEW_SCRIPT');
+
+        self::assertIsString($script);
+        self::assertStringContainsString("redis.call('TIME')[1]", $script, 'the lease clock stays Redis\'s own');
+        self::assertStringContainsString("ZADD', KEYS[1], 'XX'", $script);
+    }
+
+    /**
+     * A reply of 0 is what ZADD answers for a member whose score did not
+     * change — which a renewal landing in the same second as the
+     * previous one produces. It is not evidence of a stale receipt, so
+     * nothing is raised and nothing else is sent.
+     */
+    public function test_a_zero_changed_member_count_is_not_treated_as_a_stale_delivery(): void
+    {
+        [$queue, $link] = self::scriptedQueue(['evalsha' => 0]);
+
+        $queue->renew(self::delivery(self::envelopeString(['attempts' => 0])));
+
+        self::assertCount(1, $link->commands, 'no follow-up settlement, and no exception either');
     }
 }

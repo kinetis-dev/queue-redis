@@ -61,11 +61,18 @@ on that exact member, so a settlement for a delivery that has been
 reclaimed or already settled raises
 `Kinetis\Queue\Exception\StaleJobHandleException` and writes nothing.
 
-Recovery is not renewal. A job still running when its lease expires can
-execute alongside its replacement, so set
-`QUEUE_VISIBILITY_TIMEOUT_SECONDS` above normal job duration and keep
-handlers idempotent. `maxAttempts` bounds handlers that throw; it cannot
-bound a succession of processes that each die mid-execution.
+`RedisQueue` also declares `Kinetis\Queue\RenewableQueueInterface`, so
+`queue:work` extends a running job's lease at half
+`QUEUE_VISIBILITY_TIMEOUT_SECONDS`: one Lua script resetting that exact
+leased member's expiry to Redis `TIME` plus the window, with
+`ZADD ... XX` as the fence. The setting therefore sizes crash recovery,
+not job duration.
+
+Delivery is still at least once, so keep handlers idempotent. A lease
+still expires under a job whose worker died and under a handler that
+never yields to the event loop, and such a job can execute alongside its
+replacement. `maxAttempts` bounds handlers that throw; it cannot bound a
+succession of processes that each die mid-execution.
 
 There is no reaper process. Every `pop()` promotes due delayed jobs and
 reclaims expired leases for each queue it is given, in priority order,
