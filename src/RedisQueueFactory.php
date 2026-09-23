@@ -45,8 +45,21 @@ final class RedisQueueFactory
      */
     private const int DEFAULT_VISIBILITY_TIMEOUT_SECONDS = 300;
 
+    /**
+     * A queue script names several keys with no shared hash tag, which a
+     * cluster would reject or split across nodes, so the connection's own
+     * `REDIS_CLUSTER` is refused before any client is built.
+     */
     public static function fromConfig(Config $config, string $connectionName = 'default'): RedisQueue
     {
+        $clusterKey = Config::scopedKey('REDIS_CLUSTER', $connectionName);
+
+        if ($config->bool($clusterKey, false)) {
+            throw new InvalidArgumentException(
+                "{$clusterKey} enables Redis Cluster, but kinetis/queue-redis supports standalone Redis only.",
+            );
+        }
+
         $options = self::options($config, $connectionName);
         $visibilityTimeout = self::visibilityTimeoutSeconds($config, $connectionName);
         $url = $config->string(Config::scopedKey('REDIS_URL', $connectionName), '');
