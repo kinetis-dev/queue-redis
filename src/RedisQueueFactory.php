@@ -14,11 +14,12 @@ use Kinetis\Redis\ConnectionUri;
 use Kinetis\Redis\Endpoint;
 
 /**
- * Builds the Redis queue backend `QUEUE_CONNECTION=redis` selects —
- * called by `kinetis/queue`'s own `QueueFactory::fromConfig()`, gated
- * behind a `class_exists()` check so core never depends on this package
- * directly, the same pattern used for every other optional queue
- * backend (`kinetis/queue-sqs`, `kinetis/queue-rabbitmq`).
+ * Builds the Redis queue backend for a connection whose selector is
+ * `redis` (`QUEUE_CONNECTION=redis` for the default one) — called by
+ * `kinetis/queue`'s own `QueueFactory::fromConfig()`, gated behind a
+ * `class_exists()` check so core never depends on this package directly,
+ * the same pattern used for every other optional queue backend
+ * (`kinetis/queue-sqs`, `kinetis/queue-rabbitmq`).
  *
  * Returns the concrete `RedisQueue`, which declares both the clearing
  * and the disposal capability; see `QueueFactory` for why the
@@ -32,8 +33,7 @@ use Kinetis\Redis\Endpoint;
  * `Amp\Redis\RedisClient` facade the queue runs commands through
  * exposes none. A caller binding this result itself registers
  * `$queue->dispose(...)` on the scope it binds into;
- * `Kinetis\Queue\PackageBootstrap` does that for the queue
- * `QUEUE_CONNECTION=redis` builds.
+ * `Kinetis\Queue\PackageBootstrap` does that for the queue it binds.
  */
 final class RedisQueueFactory
 {
@@ -62,7 +62,9 @@ final class RedisQueueFactory
 
         $options = self::options($config, $connectionName);
         $visibilityTimeout = self::visibilityTimeoutSeconds($config, $connectionName);
-        $url = $config->string(Config::scopedKey('REDIS_URL', $connectionName), '');
+        $urlKey = Config::scopedKey('REDIS_URL', $connectionName);
+        $hostKey = Config::scopedKey('REDIS_HOST', $connectionName);
+        $url = $config->string($urlKey, '');
 
         if ($url !== '') {
             $parsed = ConnectionUri::parse($url);
@@ -74,10 +76,10 @@ final class RedisQueueFactory
             return new RedisQueue(new RedisClient($client->link()), $visibilityTimeout, $client->close(...));
         }
 
-        $host = $config->string(Config::scopedKey('REDIS_HOST', $connectionName), '');
+        $host = $config->string($hostKey, '');
 
         if ($host === '') {
-            throw new InvalidArgumentException('REDIS_URL or REDIS_HOST must be set when QUEUE_CONNECTION=redis.');
+            throw new InvalidArgumentException("{$urlKey} or {$hostKey} must be set for a Redis queue connection.");
         }
 
         $client = Client::create(

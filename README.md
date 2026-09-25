@@ -90,8 +90,9 @@ QUEUE_VISIBILITY_TIMEOUT_SECONDS=300
 before any worker may reclaim it. It defaults to 300 and must be a
 positive integer. Every other key this backend reads — `REDIS_HOST`/
 `REDIS_URL`/`REDIS_TLS`/... — is the exact one [`kinetis/cache-redis`](https://github.com/kinetis-dev/cache-redis)'s
-`RedisSimpleCache` already reads, scoped by `QUEUE_CONNECTION_NAME` the
-same way every other backend is. The connection's own `REDIS_CLUSTER`
+`RedisSimpleCache` already reads, scoped by the queue connection's name
+the same way every other backend is (see
+[kinetis.dev/docs/queue.html](https://kinetis.dev/docs/queue.html#named-connections)). The connection's own `REDIS_CLUSTER`
 is read and rejected: this backend supports standalone Redis only, so
 `true` throws an `InvalidArgumentException` naming that key. A named
 connection reads only its scoped key, so a cluster on the unscoped keys

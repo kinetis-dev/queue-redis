@@ -83,7 +83,20 @@ final class RedisQueueFactoryTest extends TestCase
         $config = new Config([]);
 
         $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('REDIS_URL or REDIS_HOST must be set when QUEUE_CONNECTION=redis.');
+        $this->expectExceptionMessage('REDIS_URL or REDIS_HOST must be set for a Redis queue connection.');
         RedisQueueFactory::fromConfig($config);
+    }
+
+    /**
+     * The unscoped keys do not configure a named connection, so the
+     * failure names the scoped keys that were read.
+     */
+    public function test_a_named_connection_without_url_or_host_names_its_scoped_keys(): void
+    {
+        $config = new Config(['REDIS_HOST' => 'localhost']);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('REDIS_JOBS_URL or REDIS_JOBS_HOST must be set for a Redis queue connection.');
+        RedisQueueFactory::fromConfig($config, 'jobs');
     }
 }
