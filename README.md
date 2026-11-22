@@ -109,7 +109,7 @@ package; full reference:
 composer require kinetis/queue-redis
 ```
 
-Requires PHP 8.4+, [`kinetis/framework`](https://github.com/kinetis-dev/framework), [`kinetis/queue`](https://github.com/kinetis-dev/queue), and
+Requires PHP 8.4 or 8.5, [`kinetis/framework`](https://github.com/kinetis-dev/framework), [`kinetis/queue`](https://github.com/kinetis-dev/queue), and
 [`kinetis/redis`](https://github.com/kinetis-dev/redis). Full documentation:
 [kinetis.dev/docs/queue-redis.html](https://kinetis.dev/docs/queue-redis.html).
 
